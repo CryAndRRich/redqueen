@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/luuvanson/Desktop/redqueen/scripts/pre_compact_update.py"
+          }
+        ]
+      }
+    ]
+  }
+}
