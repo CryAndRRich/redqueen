@@ -4,7 +4,8 @@ Phase 2 — Behavioral Cloning trainer.
 Trains BomberPolicyNet on (spatial, aux) → action dataset with Focal Loss
 to handle class imbalance (PLACE_BOMB is ~15% of actions).
 
-Reads:  data/bc_dataset.npz  (produced by history_parser.py)
+Reads:  data/bc_dataset/   (directory produced by history_parser.py)
+        OR data/bc_dataset.npz  (legacy single-file format)
 Writes: checkpoints/bc_{epoch}ep_{timestamp}.pt
 """
 
@@ -18,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -26,6 +27,59 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from src.models.policy_network import BomberPolicyNet  # noqa: E402
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Dataset — supports both memmap directory and legacy .npz                     #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+class BCDataset(Dataset):
+    """
+    Lazy-loading dataset backed by np.memmap files (directory format) or .npz.
+
+    Directory format (from history_parser.py):
+        bc_dataset/
+          spatial.npy       (N, 15, 13, 13) float32  — memmap
+          aux.npy           (N, 7)          float32
+          actions.npy       (N,)            int64
+          action_masks.npy  (N, 6)          bool
+          _n.npy            scalar          int64
+
+    With memmap: only batch pages are loaded into RAM — peak usage = O(batch_size).
+    With .npz:   full dataset is loaded into RAM (legacy path, for small datasets).
+    """
+
+    def __init__(self, dataset_path: Path) -> None:
+        if dataset_path.is_dir():
+            n = int(np.load(dataset_path / "_n.npy"))
+            # Open memmaps read-only — data stays on disk until accessed
+            self._spatial = np.memmap(dataset_path / "spatial.npy",      dtype="float32", mode="r", shape=(n, 15, 13, 13))
+            self._aux     = np.memmap(dataset_path / "aux.npy",          dtype="float32", mode="r", shape=(n, 7))
+            self._actions = np.memmap(dataset_path / "actions.npy",      dtype="int64",   mode="r", shape=(n,))
+            self._masks   = np.memmap(dataset_path / "action_masks.npy", dtype="bool",    mode="r", shape=(n, 6))
+            self._n = n
+            self._is_memmap = True
+        else:
+            # Legacy .npz — loads fully into RAM
+            data = np.load(dataset_path, allow_pickle=False)
+            self._spatial = data["spatial"].astype(np.float32)
+            self._aux     = data["aux"].astype(np.float32)
+            self._actions = data["actions"].astype(np.int64)
+            self._masks   = data["action_masks"].astype(bool)
+            self._n = len(self._actions)
+            self._is_memmap = False
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx: int) -> tuple:
+        # np.array() copies the memmap slice → safe for multiprocessing DataLoader
+        return (
+            torch.from_numpy(np.array(self._spatial[idx], dtype="float32")),
+            torch.from_numpy(np.array(self._aux[idx],     dtype="float32")),
+            torch.tensor(int(self._actions[idx]),          dtype=torch.long),
+            torch.from_numpy(np.array(self._masks[idx],   dtype=bool)),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -48,7 +102,6 @@ class FocalLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         log_probs = torch.log_softmax(logits, dim=1)
-        # log_probs[i, targets[i]]
         log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
         pt = log_pt.exp()
         focal_weight = (1.0 - pt) ** self.gamma
@@ -74,7 +127,6 @@ def masked_focal_loss(
     Apply action mask before computing focal loss.
     Fills invalid action logits with -1e9 before softmax.
     """
-    # masks: (B, 6) bool — True = valid
     masked_logits = logits.masked_fill(~masks, -1e9)
     log_probs = torch.log_softmax(masked_logits, dim=1)
     log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
@@ -103,7 +155,7 @@ def train_bc(
     Train BomberPolicyNet via Behavioral Cloning.
 
     Args:
-        dataset_path: .npz file from history_parser.py
+        dataset_path: directory from history_parser.py OR legacy .npz file
         output_dir:   directory for checkpoints
         epochs:       number of training epochs
         batch_size:   mini-batch size
@@ -122,34 +174,31 @@ def train_bc(
     dev = torch.device(device)
     print(f"Device: {dev}")
 
-    # ── Load dataset ─────────────────────────────────────────────────── #
+    # ── Load dataset ─────────────────────────────────────────────── #
     print(f"Loading dataset from {dataset_path} …")
-    data = np.load(dataset_path)
-    spatial_np = data["spatial"].astype(np.float32)      # (N, 15, 13, 13)
-    aux_np     = data["aux"].astype(np.float32)           # (N, 7)
-    actions_np = data["actions"].astype(np.int64)         # (N,)
-    masks_np   = data["action_masks"].astype(bool)        # (N, 6)
-    N = len(actions_np)
-    print(f"Dataset size: {N:,} transitions")
-
-    dataset = TensorDataset(
-        torch.from_numpy(spatial_np),
-        torch.from_numpy(aux_np),
-        torch.from_numpy(actions_np),
-        torch.from_numpy(masks_np),
+    full_dataset = BCDataset(dataset_path)
+    N = len(full_dataset)
+    print(
+        f"Dataset: {N:,} transitions  "
+        f"({'memmap — lazy' if full_dataset._is_memmap else 'in-memory'})"
     )
-    val_n = max(1, int(N * val_split))
+
+    val_n   = max(1, int(N * val_split))
     train_n = N - val_n
     train_ds, val_ds = random_split(
-        dataset, [train_n, val_n],
+        full_dataset, [train_n, val_n],
         generator=torch.Generator().manual_seed(42),
     )
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=4, pin_memory=(device == "cuda"))
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=(device == "cuda"))
 
-    # ── Model ────────────────────────────────────────────────────────── #
+    # num_workers=4 works with both memmap (re-opened per worker) and in-memory
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=4, pin_memory=(device == "cuda"),
+                              persistent_workers=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              num_workers=2, pin_memory=(device == "cuda"),
+                              persistent_workers=True)
+
+    # ── Model ────────────────────────────────────────────────────── #
     model = BomberPolicyNet().to(dev)
     if init_from and init_from.exists():
         print(f"Warm-start from {init_from}")
@@ -160,7 +209,7 @@ def train_bc(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Training ─────────────────────────────────────────────────────── #
+    # ── Training ─────────────────────────────────────────────────── #
     best_val_loss = float("inf")
     best_ckpt: Path = output_dir / "bc_best.pt"
 
@@ -190,7 +239,7 @@ def train_bc(
         train_loss /= train_n
         train_acc   = correct / train_n
 
-        # ── Validation ───────────────────────────────────────────────── #
+        # ── Validation ───────────────────────────────────────────── #
         model.eval()
         val_loss = 0.0
         val_correct = 0
@@ -212,7 +261,7 @@ def train_bc(
             f"lr {scheduler.get_last_lr()[0]:.2e}"
         )
 
-        # ── Save checkpoint ───────────────────────────────────────────── #
+        # ── Save checkpoint ───────────────────────────────────────── #
         if epoch % save_every == 0:
             ts = time.strftime("%Y%m%d_%H%M%S")
             ckpt_path = output_dir / f"bc_{epoch}ep_{ts}.pt"
@@ -235,7 +284,7 @@ def train_bc(
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="Train BomberPolicyNet via Behavioral Cloning")
-    parser.add_argument("--dataset",    type=Path, default=_ROOT / "data" / "bc_dataset.npz")
+    parser.add_argument("--dataset",    type=Path, default=_ROOT / "data" / "bc_dataset")
     parser.add_argument("--output-dir", type=Path, default=_ROOT / "checkpoints")
     parser.add_argument("--epochs",     type=int,  default=50)
     parser.add_argument("--batch-size", type=int,  default=512)

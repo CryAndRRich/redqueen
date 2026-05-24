@@ -4,11 +4,16 @@ Phase 0 — BC data mining from history_game/ match files.
 Extracts (spatial, aux, action, mask) tuples from real competition matches.
 Quality filter: rank=0 winner AND survival ≥ 120 steps AND ≥ 5 bombs placed.
 
-Output: data/bc_dataset.npz
-  spatial:      (N, 15, 13, 13) float32
-  aux:          (N, 7)          float32
-  actions:      (N,)            int64
-  action_masks: (N, 6)          bool
+Output: a directory containing 4 memmap .npy files + metadata:
+  spatial.npy       (N, 15, 13, 13) float32  — written via np.memmap
+  aux.npy           (N, 7)          float32
+  actions.npy       (N,)            int64
+  action_masks.npy  (N, 6)          bool
+  _n.npy            scalar          int64     — actual number of valid rows
+
+Two-pass approach avoids accumulating data in RAM:
+  Pass 1 — scan metadata only, count N_total (no feature extraction)
+  Pass 2 — extract features, write directly to pre-allocated memmaps
 
 Frame alignment:
   obs_t  = history[t]           (state after step t's actions were applied)
@@ -97,11 +102,9 @@ def extract_from_match(
         frame_t = history[t]
         frame_t1 = history[t + 1]
 
-        # Skip if next frame has no actions (shouldn't happen, but guard)
         if frame_t1["actions"] is None:
             continue
 
-        # Skip if our agent is dead at frame t
         if not frame_t["alive"][agent_idx]:
             break
 
@@ -109,7 +112,6 @@ def extract_from_match(
 
         obs_t = _frame_to_obs(frame_t)
 
-        # Update external trackers
         players_t  = np.array(frame_t["players"])
         players_t1 = np.array(frame_t1["players"])
         prev_enemies = sum(int(players_t[i][2])  for i in range(4) if i != agent_idx)
@@ -138,6 +140,58 @@ def extract_from_match(
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
+# Pass 1 — fast count (no feature extraction)                                  #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def _pass1_count(
+    json_files: list[Path],
+    min_survival: int,
+    min_bombs: int,
+) -> tuple[int, list[tuple[Path, int]]]:
+    """
+    Scan all files, apply quality filter on metadata only, count N_total.
+
+    Returns:
+        n_total:      total valid transitions across all quality agents
+        quality_list: [(file_path, agent_idx), ...] — agents that pass filter
+    """
+    n_total = 0
+    quality_list: list[tuple[Path, int]] = []
+
+    for fp in tqdm(json_files, desc="Pass 1/2 — counting transitions"):
+        try:
+            with fp.open() as f:
+                match = json.load(f)
+        except Exception:
+            continue
+
+        n_frames = len(match["history"])
+        for agent_idx in range(4):
+            if (
+                match["ranks"][agent_idx] != 0
+                or match["survival_steps"][agent_idx] < min_survival
+                or _count_bombs_placed(match["history"], agent_idx) < min_bombs
+            ):
+                continue
+
+            # Count alive frames without feature extraction
+            n_alive = 0
+            for t in range(n_frames - 1):
+                if not match["history"][t]["alive"][agent_idx]:
+                    break
+                if match["history"][t + 1]["actions"] is not None:
+                    n_alive += 1
+
+            if n_alive > 0:
+                n_total += n_alive
+                quality_list.append((fp, agent_idx))
+
+        del match  # explicit GC after each file
+
+    return n_total, quality_list
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
 # Main parser                                                                  #
 # ─────────────────────────────────────────────────────────────────────────── #
 
@@ -149,11 +203,15 @@ def parse_history(
     min_bombs: int = MIN_BOMBS_PLACED,
 ) -> None:
     """
-    Scan history_dir for JSON match files, extract quality demos, save .npz.
+    Scan history_dir for JSON match files, extract quality demos, save to output_path/.
+
+    Two-pass approach: Pass 1 counts transitions (fast, no feature extraction),
+    Pass 2 extracts features and writes directly to pre-allocated memmaps on disk.
+    Peak RAM = O(one match file + one batch of features) regardless of dataset size.
 
     Args:
         history_dir:  path to history_game/ root (recursively searched)
-        output_path:  destination .npz file
+        output_path:  destination directory (will contain .npy memmap files)
         max_files:    limit number of JSON files processed (None = all)
         min_survival: override quality filter survival threshold
         min_bombs:    override quality filter bombs threshold
@@ -162,15 +220,36 @@ def parse_history(
     if max_files:
         json_files = json_files[:max_files]
 
-    spatials: list[np.ndarray] = []
-    auxes:    list[np.ndarray] = []
-    actions_: list[int]        = []
-    masks_:   list[np.ndarray] = []
+    print(f"Found {len(json_files):,} JSON files in {history_dir}")
 
+    # ── Pass 1: count quality transitions ──────────────────────────────── #
+    n_total, quality_list = _pass1_count(json_files, min_survival, min_bombs)
+
+    print(
+        f"Pass 1 complete: {len(quality_list)} quality trajectories, "
+        f"{n_total:,} transitions"
+    )
+
+    if n_total == 0:
+        print("No quality transitions found. Try relaxing the quality filter.")
+        return
+
+    # ── Pre-allocate memmaps ───────────────────────────────────────────── #
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    sp_mm   = np.memmap(output_path / "spatial.npy",      dtype="float32", mode="w+", shape=(n_total, 15, 13, 13))
+    aux_mm  = np.memmap(output_path / "aux.npy",          dtype="float32", mode="w+", shape=(n_total, 7))
+    act_mm  = np.memmap(output_path / "actions.npy",      dtype="int64",   mode="w+", shape=(n_total,))
+    mask_mm = np.memmap(output_path / "action_masks.npy", dtype="bool",    mode="w+", shape=(n_total, 6))
+
+    disk_gb = n_total * (15 * 13 * 13 * 4 + 7 * 4 + 8 + 6) / 1e9
+    print(f"Pre-allocated {disk_gb:.2f} GB on disk at {output_path}/")
+
+    # ── Pass 2: extract features, fill memmaps ─────────────────────────── #
+    idx = 0
     skipped = 0
-    parsed = 0
 
-    for fp in tqdm(json_files, desc="Parsing matches"):
+    for fp, agent_idx in tqdm(quality_list, desc="Pass 2/2 — extracting features"):
         try:
             with fp.open() as f:
                 match = json.load(f)
@@ -178,48 +257,42 @@ def parse_history(
             skipped += 1
             continue
 
-        for agent_idx in range(4):
-            # Override thresholds if requested
-            if (
-                match["ranks"][agent_idx] != 0
-                or match["survival_steps"][agent_idx] < min_survival
-                or _count_bombs_placed(match["history"], agent_idx) < min_bombs
-            ):
-                continue
+        for spatial, aux, action, mask in extract_from_match(match, agent_idx):
+            if idx >= n_total:
+                break  # guard against count mismatch
+            sp_mm[idx]   = spatial
+            aux_mm[idx]  = aux
+            act_mm[idx]  = action
+            mask_mm[idx] = mask
+            idx += 1
 
-            for spatial, aux, action, mask in extract_from_match(match, agent_idx):
-                spatials.append(spatial)
-                auxes.append(aux)
-                actions_.append(action)
-                masks_.append(mask)
+        del match
 
-        parsed += 1
+    actual_n = idx
 
-    print(f"Parsed {parsed} files, skipped {skipped}, extracted {len(actions_)} transitions")
+    # Flush memmaps to disk before reading back
+    del sp_mm, aux_mm, act_mm, mask_mm
 
-    if not actions_:
-        print("No quality transitions found. Try relaxing the quality filter.")
-        return
+    # Save actual count (may differ slightly from estimate due to off-by-one edge cases)
+    np.save(output_path / "_n.npy", np.array(actual_n, dtype=np.int64))
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        spatial=np.stack(spatials).astype(np.float32),
-        aux=np.stack(auxes).astype(np.float32),
-        actions=np.array(actions_, dtype=np.int64),
-        action_masks=np.stack(masks_).astype(np.bool_),
-    )
-    print(f"Saved dataset → {output_path}  ({len(actions_)} samples)")
+    if actual_n != n_total:
+        print(f"  Note: actual transitions ({actual_n:,}) ≠ estimated ({n_total:,})")
 
-    # Class distribution
+    print(f"\nSaved dataset → {output_path}/  ({actual_n:,} samples)")
+    print(f"  Files: spatial.npy, aux.npy, actions.npy, action_masks.npy, _n.npy")
+    print(f"  Skipped {skipped} files (parse errors)")
+
+    # ── Action distribution ────────────────────────────────────────────── #
+    actions_final = np.memmap(output_path / "actions.npy", dtype="int64", mode="r", shape=(actual_n,))
     from collections import Counter
-    dist = Counter(actions_)
-    total = len(actions_)
-    print("Action distribution:")
+    dist = Counter(int(a) for a in actions_final)
     names = ["STOP", "LEFT", "RIGHT", "UP", "DOWN", "BOMB"]
+    print("Action distribution:")
     for a in range(6):
-        pct = 100.0 * dist.get(a, 0) / total
+        pct = 100.0 * dist.get(a, 0) / max(actual_n, 1)
         print(f"  {names[a]:5s} ({a}): {dist.get(a, 0):7d}  {pct:.1f}%")
+    del actions_final
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -235,8 +308,8 @@ def _cli() -> None:
     )
     parser.add_argument(
         "--output", type=Path,
-        default=_ROOT / "data" / "bc_dataset.npz",
-        help="Output .npz path",
+        default=_ROOT / "data" / "bc_dataset",
+        help="Output directory (will contain .npy memmap files)",
     )
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--min-survival", type=int, default=MIN_SURVIVAL)
