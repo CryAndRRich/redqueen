@@ -23,7 +23,14 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import os
 import numpy as np
+
+# Suppress TF/XLA/gRPC C++ warnings that fire when CUDA workers start.
+# Must be set before any subprocess spawns so workers inherit these values.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
@@ -83,12 +90,7 @@ def _make_opponents(stage_name: str, opp_ids: list[int]):
     if stage_name == "simple":
         return [SimpleRuleAgent(i) for i in opp_ids]
     if stage_name == "genius_nobomb":
-        agents = []
-        for i in opp_ids:
-            a = GeniusRuleAgent(i)
-            a._no_bomb = True  # patched below
-            agents.append(a)
-        return agents
+        return [GeniusRuleAgent(i) for i in opp_ids]  # wrapped by _NoBombWrapper in _make_env_fn
     if stage_name == "genius":
         return [GeniusRuleAgent(i) for i in opp_ids]
     raise ValueError(f"Unknown stage: {stage_name}")
@@ -223,25 +225,22 @@ class PastAgentWrapper:
 
 class CurriculumAdvanceCallback:
     """
-    Checks win rate every eval_freq steps.
-    If win_rate >= threshold for patience consecutive windows, advance stage.
+    Checks win rate after every learn() call.
+    If win_rate >= threshold for `patience` consecutive windows, advance stage.
     """
 
     def __init__(
         self,
         eval_env_fn: Callable,
         n_eval_episodes: int = 100,
-        eval_freq: int = 50_000,
         win_rate_threshold: float = 0.60,
         patience: int = 3,
     ) -> None:
         self.eval_env_fn = eval_env_fn
         self.n_eval_episodes = n_eval_episodes
-        self.eval_freq = eval_freq
         self.threshold = win_rate_threshold
         self.patience = patience
         self._consecutive = 0
-        self._should_advance = False
 
     def evaluate(self, model) -> float:
         """Run n_eval_episodes, return win rate."""
@@ -287,9 +286,12 @@ def train_curriculum(
     device: str = "auto",
 ) -> Path:
     """Phase 3: curriculum PPO training."""
+    import warnings
     import torch
-    from stable_baselines3.common.env_util import make_vec_env
     from stable_baselines3.common.vec_env import SubprocVecEnv
+
+    # Suppress SB3 net_arch deprecation warning
+    warnings.filterwarnings("ignore", message=".*shared layers.*", category=UserWarning)
 
     MaskablePPO, _ = _make_maskable_ppo()
     _write_past_agent_wrapper()
@@ -316,7 +318,7 @@ def train_curriculum(
                 policy_kwargs={
                     "features_extractor_class": BomberCNNExtractor,
                     "features_extractor_kwargs": {"features_dim": 256},
-                    "net_arch": [dict(pi=[128], vf=[128])],
+                    "net_arch": dict(pi=[128], vf=[128]),
                 },
                 verbose=1,
                 device=device,
@@ -330,7 +332,7 @@ def train_curriculum(
 
         eval_fn = _make_env_fn(stage_name, seed=9999)
         cb = CurriculumAdvanceCallback(
-            eval_fn, n_eval_episodes=100, eval_freq=50_000,
+            eval_fn, n_eval_episodes=100,
             win_rate_threshold=wr_thresh, patience=3,
         )
 
@@ -370,9 +372,11 @@ def train_self_play(
     device: str = "auto",
 ) -> Path:
     """Phase 4: continuous self-play PPO training."""
+    import warnings
     import torch
     from stable_baselines3.common.vec_env import SubprocVecEnv
 
+    warnings.filterwarnings("ignore", message=".*shared layers.*", category=UserWarning)
     MaskablePPO, _ = _make_maskable_ppo()
     _write_past_agent_wrapper()
 
@@ -393,7 +397,7 @@ def train_self_play(
         policy_kwargs={
             "features_extractor_class": BomberCNNExtractor,
             "features_extractor_kwargs": {"features_dim": 256},
-            "net_arch": [dict(pi=[128], vf=[128])],
+            "net_arch": dict(pi=[128], vf=[128]),
         },
         verbose=1,
         device=device,

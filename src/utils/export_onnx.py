@@ -100,6 +100,7 @@ def export_to_onnx(
         input_names=["spatial", "aux"],
         output_names=["logits"],
         dynamic_axes=None,  # fixed shapes for best onnxruntime performance
+        dynamo=False,        # use TorchScript exporter — no onnxscript dep needed
     )
     print(f"Exported: {output_path}  ({output_path.stat().st_size / 1024:.1f} KB)")
 
