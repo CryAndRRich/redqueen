@@ -500,3 +500,13 @@ No. League Training is the mechanism for combining knowledge across model versio
     "trigger": "manual",
     "custom_instructions": ""
   }
+
+### 2026-05-24 08:46 — Auto-compact snapshot
+  {
+    "session_id": "172dfe2f-1195-4ec7-b47d-1751357f98e5",
+    "transcript_path": "/Users/luuvanson/.claude/projects/-Users-luuvanson-Desktop-redqueen/172dfe2f-1195-4ec7-b47d-1751357f98e5.jsonl",
+    "cwd": "/Users/luuvanson/Desktop/redqueen",
+    "hook_event_name": "PreCompact",
+    "trigger": "manual",
+    "custom_instructions": ""
+  }

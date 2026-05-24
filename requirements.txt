@@ -2,9 +2,7 @@
 #  Core ML — Python 3.11
 # ============================================================
 torch>=2.2.0,<3.0.0
-torchvision>=0.17.0
 numpy>=1.26.0,<2.0.0
-scipy>=1.12.0
 
 # ============================================================
 #  ONNX — export & fast inference (<100 ms/step target)
@@ -16,8 +14,8 @@ onnxruntime>=1.18.0
 #  RL frameworks
 # ============================================================
 stable-baselines3>=2.3.0
+sb3-contrib>=2.3.0
 gymnasium>=0.29.1
-imitation>=1.0.0        # Behavioral Cloning & GAIL helpers
 
 # ============================================================
 #  Experiment tracking & visualisation
@@ -27,19 +25,10 @@ tqdm>=4.66.0
 matplotlib>=3.8.0
 
 # ============================================================
-#  Game engine dependencies
+#  Game engine / local dev
 # ============================================================
 pygame>=2.5.2
-
-# ============================================================
-#  Competition infrastructure
-# ============================================================
 trueskill>=0.4.5
-Flask>=3.0.0
-google-auth>=2.29.0
-google-auth-httplib2>=0.2.0
-google-auth-oauthlib>=1.2.0
-google-api-python-client>=2.120.0
 
 # ============================================================
 #  Testing
