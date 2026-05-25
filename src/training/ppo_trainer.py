@@ -70,15 +70,27 @@ PPO_DEFAULTS: dict = {
 
 # Curriculum stages: (opponent_fn_name, avg_rank_threshold)
 # avg_rank: 0=win, 1=2nd, 2=3rd, 3=died early — lower is better.
-# Agent must achieve avg_rank <= threshold for `patience` consecutive windows to advance.
+# Opponents include an anti-forgetting anchor (1 easier agent) from Stage 2 onward.
+# Ref: IJCAI 2024 workshop — rule-based anchors prevent catastrophic forgetting.
 CURRICULUM_STAGES = [
-    ("random",   1.0),   # Stage 0: 3 random opponents — warm-up
-    ("simple",   1.5),   # Stage 1: 3 simple rule agents — basic danger avoidance
-    ("smarter",  1.8),   # Stage 2: 3 smarter agents — BFS-aware bridge stage
-    ("tactical", 2.0),   # Stage 3: 3 tactical agents — primary leaderboard target
-    ("trapper",  2.0),   # Stage 4: 3 trapper agents — kill-hunters (attack defence)
-    ("genius",   2.0),   # Stage 5: 3 genius agents — hardest baseline
+    ("random",   0.8),   # Stage 0: must dominate randoms (tightened from 1.0)
+    ("simple",   1.2),   # Stage 1: must clearly beat simple (tightened from 1.5)
+    ("smarter",  1.8),   # Stage 2: 2 smarter + 1 simple anchor
+    ("tactical", 2.0),   # Stage 3: 2 tactical + 1 smarter anchor
+    ("trapper",  2.0),   # Stage 4: 2 trapper + 1 tactical anchor
+    ("genius",   2.0),   # Stage 5: 2 genius + 1 tactical anchor
 ]
+
+# ent_coef per stage: re-inject exploration when entering harder stages.
+# BC pretraining makes policy deterministic; entropy collapses fast during Stage 1.
+# Boosting ent_coef at Stage 2+ provides stronger gradient signal to maintain exploration.
+# Ref: Meishner et al. 2019; entropy scheduling literature.
+STAGE_ENT_COEF = [0.02, 0.02, 0.04, 0.04, 0.04, 0.04]
+
+# Minimum steps per stage regardless of win-rate threshold being met.
+# Prevents premature advancement before skills are consolidated.
+# Ref: Meishner et al. 2019 — 200k steps minimum for consolidation.
+MIN_STEPS_PER_STAGE = 200_000
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -97,16 +109,18 @@ def _make_opponents(stage_name: str, opp_ids: list[int]):
     if stage_name == "simple":
         return [SimpleRuleAgent(i) for i in opp_ids]
     if stage_name == "smarter":
-        return [SmarterRuleAgent(i) for i in opp_ids]
+        # 2 smarter + 1 simple anchor — prevents forgetting Stage 1 survival skills
+        return [SmarterRuleAgent(opp_ids[0]), SmarterRuleAgent(opp_ids[1]), SimpleRuleAgent(opp_ids[2])]
     if stage_name == "tactical":
-        return [TacticalRuleAgent(i) for i in opp_ids]
+        # 2 tactical + 1 smarter anchor
+        return [TacticalRuleAgent(opp_ids[0]), TacticalRuleAgent(opp_ids[1]), SmarterRuleAgent(opp_ids[2])]
     if stage_name == "trapper":
-        return [TrapperRuleAgent(i) for i in opp_ids]
+        # 2 trapper + 1 tactical anchor
+        return [TrapperRuleAgent(opp_ids[0]), TrapperRuleAgent(opp_ids[1]), TacticalRuleAgent(opp_ids[2])]
     if stage_name == "genius":
-        return [GeniusRuleAgent(i) for i in opp_ids]
-    # Mixed opponent sets for flexible use
+        # 2 genius + 1 tactical anchor
+        return [GeniusRuleAgent(opp_ids[0]), GeniusRuleAgent(opp_ids[1]), TacticalRuleAgent(opp_ids[2])]
     if stage_name == "mixed_t_g":
-        # 2 tactical + 1 genius — harder than pure tactical, softer than pure genius
         return [TacticalRuleAgent(opp_ids[0]), TacticalRuleAgent(opp_ids[1]), GeniusRuleAgent(opp_ids[2])]
     raise ValueError(f"Unknown stage: {stage_name}")
 
@@ -229,7 +243,11 @@ class CurriculumAdvanceCallback:
     """
     Checks average rank after every learn() call.
     Rank: 0=win (sole survivor), 1=2nd, 2=3rd, 3=died early — lower is better.
-    If avg_rank <= threshold for `patience` consecutive windows, advance stage.
+
+    Advances stage when ALL of the following hold:
+      1. avg_rank <= threshold for `patience` consecutive windows
+      2. No worsening trend (rank delta > 0.15 over last 3 evals resets counter)
+      3. At least `min_steps` have been taken in this stage (consolidation guard)
     """
 
     def __init__(
@@ -238,12 +256,16 @@ class CurriculumAdvanceCallback:
         n_eval_episodes: int = 100,
         rank_threshold: float = 1.5,
         patience: int = 3,
+        min_steps: int = MIN_STEPS_PER_STAGE,
     ) -> None:
         self.eval_env_fn = eval_env_fn
         self.n_eval_episodes = n_eval_episodes
         self.threshold = rank_threshold
         self.patience = patience
+        self.min_steps = min_steps
         self._consecutive = 0
+        self._history: list[float] = []
+        self._steps_in_stage: int = 0
 
     def evaluate(self, model) -> float:
         """Run n_eval_episodes, return average rank (lower is better)."""
@@ -269,14 +291,31 @@ class CurriculumAdvanceCallback:
         env.close()
         return total_rank / self.n_eval_episodes
 
-    def check(self, model) -> bool:
+    def check(self, model, steps_this_iter: int = 50_000) -> bool:
         """Return True if curriculum should advance."""
+        self._steps_in_stage += steps_this_iter
         avg_rank = self.evaluate(model)
+        self._history.append(avg_rank)
         print(f"  Avg rank: {avg_rank:.2f} (threshold ≤ {self.threshold:.1f})")
+
         if avg_rank <= self.threshold:
             self._consecutive += 1
         else:
             self._consecutive = 0
+
+        # Trend guard: worsening by >0.15 over the last 3 evals resets counter.
+        # Prevents advancing while the policy is deteriorating.
+        if len(self._history) >= 3:
+            trend = self._history[-1] - self._history[-3]
+            if trend > 0.15 and self._consecutive > 0:
+                print(f"  ↓ Worsening trend ({trend:+.2f} over 3 evals) — resetting consecutive count")
+                self._consecutive = 0
+
+        # Consolidation guard: enforce minimum steps before advancing
+        if self._steps_in_stage < self.min_steps:
+            print(f"  ⏳ Min steps not reached ({self._steps_in_stage:,}/{self.min_steps:,}), holding")
+            return False
+
         return self._consecutive >= self.patience
 
 
@@ -335,11 +374,18 @@ def train_curriculum(
                 _load_bc_into_sb3(model, init_from, device)
         else:
             model.set_env(vec_env)
+            # Re-inject exploration entropy when entering a harder stage.
+            # Entropy collapses during early stages (BC init → deterministic policy);
+            # boosting ent_coef provides gradient signal to re-open the action distribution.
+            ent_coef = STAGE_ENT_COEF[stage_idx]
+            model.ent_coef = ent_coef
+            print(f"  ent_coef reset to {ent_coef} for stage {stage_idx}")
 
         eval_fn = _make_env_fn(stage_name, seed=9999)
         cb = CurriculumAdvanceCallback(
             eval_fn, n_eval_episodes=100,
             rank_threshold=wr_thresh, patience=3,
+            min_steps=MIN_STEPS_PER_STAGE,
         )
 
         steps_done = 0
@@ -357,7 +403,7 @@ def train_curriculum(
             _save_sb3_weights(model, ckpt)
             print(f"  Saved {ckpt.name}")
 
-            if cb.check(model):
+            if cb.check(model, steps_this_iter=50_000):
                 print(f"  → Advancing to next stage!")
                 break
 
