@@ -1,14 +1,17 @@
 """
-Reward function v2 — tie-break aware for Bomberland FFA.
+Reward function v3 — tie-break + game-mechanics aware for Bomberland FFA.
 
-Changes from v1 (agent/dqn_agent/reward.py):
-  - kill_credit +1.5 (tie-break #1, was 1.0)
-  - box_destroyed +0.4 per confirmed box (tie-break #2, previously absent)
-  - plant_near_box REMOVED (misleading proxy)
-  - bomb_placed +0.003 (tie-break #4 padding, new)
-  - survival_step +0.005/step (new — explicit survival signal)
-  - approach_enemy reduced 0.02 → 0.006 (dangerous in FFA)
-  - own_blast_loiter scaled by urgency (unchanged from v1)
+Changes from v2:
+  - item_collected 0.15 → 0.3  (tie-break #3 was underweighted)
+  - kill_credit 1.5 → 2.0 with late-game bonus ×1.5 when enemies_alive drops to 1
+    (last kill = game-winner; aligns with win: 3.0 terminal reward)
+  - chain_reaction_bonus +0.3: placed bomb near existing bomb(s) with short timer
+    (tie-break synergy: chain reactions destroy more boxes and can multi-kill)
+  - item_contest_urgency: +0.1 when moving toward an item that an enemy is also
+    approaching (simultaneous collection destroys item per competition rules)
+  - box_destroyed attribution improved: only count confirmed-mine boxes when
+    a MY bomb has timer <= 1 in prev_obs; fall back to all-boxes otherwise
+  - approach_enemy kept at 0.006 (FFA-safe, do not raise)
 """
 
 from __future__ import annotations
@@ -21,23 +24,26 @@ import numpy as np
 
 REWARDS: dict[str, float] = {
     # Terminal
-    "win":               3.0,
-    "agent_death":      -2.0,
-    # Tie-break stats
-    "kill_credit":       1.5,
-    "box_destroyed":     0.4,
-    "item_collected":    0.15,
-    "bomb_placed":       0.003,
+    "win":                  3.0,
+    "agent_death":         -2.0,
+    # Tie-break stats (priority order: kills > boxes > items > bombs)
+    "kill_credit":          2.0,   # v3: raised from 1.5; last-kill bonus applied separately
+    "box_destroyed":        0.4,
+    "item_collected":       0.3,   # v3: raised from 0.15 (tie-break #3 was underweighted)
+    "bomb_placed":          0.003,
+    # Tactical bonuses
+    "chain_reaction":       0.3,   # v3: bonus for placing bomb adjacent to another active bomb
+    "item_contest":         0.1,   # v3: bonus for moving toward item an enemy is also approaching
     # Danger shaping
-    "danger_evasion":    0.12,
-    "danger_enter":     -0.08,
-    "own_blast_loiter": -0.04,
+    "danger_evasion":       0.12,
+    "danger_enter":        -0.08,
+    "own_blast_loiter":    -0.04,
     # Movement
-    "survival_step":     0.005,
-    "standing_still":   -0.008,
-    "time_penalty":     -0.003,
-    # Enemy pressure (FFA-safe)
-    "approach_enemy":    0.006,
+    "survival_step":        0.005,
+    "standing_still":      -0.008,
+    "time_penalty":        -0.003,
+    # Enemy pressure (FFA-safe — do not raise, dangerous in multi-agent)
+    "approach_enemy":       0.006,
 }
 
 # Internal constants
@@ -183,8 +189,12 @@ def compute_reward(
     kills = max(0, prev_enemies - curr_enemies)
     if kills:
         reward += kills * REWARDS["kill_credit"]
+        # Late-game bonus: last kill secures win — extra incentive when only 1 enemy left
         if curr_enemies == 0:
             reward += REWARDS["win"]
+        elif prev_enemies == 1:
+            # Down to last enemy: killing this one is especially valuable
+            reward += REWARDS["kill_credit"] * 0.5
 
     # ── Confirmed box destruction ─────────────────────────────────────── #
     prev_grid = np.asarray(prev_obs["map"])
@@ -201,9 +211,39 @@ def compute_reward(
     if curr_radius > prev_radius or curr_cap > prev_cap:
         reward += REWARDS["item_collected"]
 
-    # ── Bomb placed ───────────────────────────────────────────────────── #
+    # ── Item contest bonus ────────────────────────────────────────────── #
+    # Reward moving toward an item that an enemy is also approaching.
+    # Per competition rules: simultaneous collection destroys the item.
+    px, py = int(prev_p[aid][0]), int(prev_p[aid][1])
+    cx, cy = int(curr_p[aid][0]), int(curr_p[aid][1])
+    if px != cx or py != cy:
+        item_tiles = set(
+            zip(*np.where(np.isin(np.asarray(curr_obs["map"]), [3, 4])))
+        )
+        if item_tiles:
+            my_dist_to_nearest = min(abs(cx - ix) + abs(cy - iy) for ix, iy in item_tiles)
+            enemy_min_dist = min(
+                (min(abs(int(curr_p[i][0]) - ix) + abs(int(curr_p[i][1]) - iy) for ix, iy in item_tiles)
+                 for i in range(len(curr_p)) if i != aid and int(curr_p[i][2]) == 1),
+                default=999,
+            )
+            if my_dist_to_nearest <= 3 and enemy_min_dist <= my_dist_to_nearest + 2:
+                reward += REWARDS["item_contest"]
+
+    # ── Bomb placed + chain reaction bonus ───────────────────────────── #
     if prev_cap > curr_cap:  # used a bomb slot
         reward += REWARDS["bomb_placed"]
+        # Chain reaction bonus: placing bomb adjacent to another active bomb
+        # that has a short timer encourages strategic chaining
+        curr_bombs = _parse_bombs(curr_obs["bombs"])
+        if curr_bombs is not None:
+            for row in curr_bombs:
+                bx, by, timer, owner = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+                if int(owner) == aid:
+                    continue  # skip own just-placed bomb
+                if timer <= 4 and abs(bx - cx) + abs(by - cy) <= 2:
+                    reward += REWARDS["chain_reaction"]
+                    break  # one bonus per step
 
     # ── Movement / standing still ─────────────────────────────────────── #
     px, py = int(prev_p[aid][0]), int(prev_p[aid][1])

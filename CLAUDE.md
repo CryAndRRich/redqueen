@@ -21,11 +21,68 @@
 
 ---
 
-## 2. Competition Live Rules *(Last updated: 2026-05-24)*
+## 2. Competition Live Rules *(Last updated: 2026-05-25)*
+
+### Step Processing Order (per step)
+
+```
+[Collect actions] → [Process movement] → [Place bombs] → [Decrease bomb timer]
+→ [Resolve explosion] → [Remove dead agents] → [Spawn items] → [Check termination]
+```
+
+### Agent Actions
+
+| Value | Action | Description |
+|-------|--------|-------------|
+| 0 | STOP | Stay in place |
+| 1 | LEFT | Move left 1 cell |
+| 2 | RIGHT | Move right 1 cell |
+| 3 | UP | Move up 1 cell |
+| 4 | DOWN | Move down 1 cell |
+| 5 | PLACE_BOMB | Place bomb at current position |
+
+**Movement rules:**
+- Cannot enter Wall (code 1) or Box (code 2)
+- Cannot enter a cell with an **active bomb from previous steps**. Exception: if agent just placed a bomb at that cell this step, they can still move out
+- Multiple agents CAN occupy the same cell
+- If ≥2 agents simultaneously step onto an item cell, the item is **destroyed** — no agent collects it
+
+### Bomb Mechanics (CRITICAL)
+
+**Placement condition**: `bombs_left > 0` AND current cell has no active bomb from a previous step.
+
+**Duplicate bomb rule** (multiple agents place bomb on same cell in same step):
+1. Priority goes to bomb with **larger radius**
+2. Tie on radius → priority to agent with **smaller ID**
+3. Only the "winning" agent has `bombs_left` decremented
+
+**Explosion mechanics:**
+- Spreads in 4 directions (cross pattern), blocked by Walls
+- Boxes block and are destroyed by explosion
+- Agents do NOT block explosions
+- **Chain reaction**: explosion hitting another bomb triggers that bomb immediately in the same step
+
+### Items
+
+**From box destruction**: 30% Radius item, 30% Capacity item, 40% nothing
+
+**Auto-spawn** (each empty cell, each step):
+```
+P = 0.0003 × (step / 165)
+```
+50% Radius, 50% Capacity.
+
+**Simultaneous collection**: if ≥2 agents step on same item, item is destroyed, no one gets it.
+
+### Elimination & End Conditions
+
+- Agent is eliminated immediately if standing in a blast zone (including own bomb)
+- Eliminated agents leave their bombs on the field
+- Game ends when: (1) ≤1 agent survives, OR (2) step 500 reached
 
 ### Tie-break at Step 500
 
-When a game reaches step 500 with multiple survivors, ranking among survivors is determined **in this order**:
+When multiple agents survive to step 500, ranking is determined **in this order**:
 
 ```
 1. Kills              (highest priority)
@@ -34,18 +91,32 @@ When a game reaches step 500 with multiple survivors, ranking among survivors is
 4. Bombs Placed       (lowest priority)
 ```
 
-**Strategic consequence**: passive survival is no longer optimal. An agent with 1 kill and 0 boxes beats an agent with 0 kills and 10 boxes destroyed. Every surviving step must be oriented toward getting kills or destroying boxes.
+**Strategic consequence**: passive survival is not optimal. An agent with 1 kill and 0 boxes beats an agent with 0 kills and 10 boxes destroyed.
 
 ### Submission Format (CRITICAL)
 
 ```
 submission.zip
-├── agent.py          ← MUST be at root, not inside any subfolder
-├── model.onnx        (or .pth)
-└── requirements.txt
+├── agent.py     ← MUST be at root, not inside any subfolder
+├── model.onnx   ← primary inference
+└── model.pt     ← TorchScript fallback (if onnxruntime unavailable)
 ```
 
+**Do NOT include `requirements.txt`** — the evaluator rejects it (`requirements_txt_forbidden` error).
+
 If `agent.py` is inside a subfolder (`submission/agent.py`), the evaluation engine cannot find it and the team scores ~0.
+
+### Competition Environment Libraries (BTC official requirements.txt)
+
+```
+numpy, pygame, torch, tqdm, matplotlib, trueskill
+google-auth>=2.0.0, google-auth-httplib2>=0.1.0, google-auth-oauthlib>=0.4.0
+google-api-python-client>=2.0.0, pytest>=6.0.0, Flask>=2.2.0
+tensorflow>=2.15.0, stable-baselines3>=2.2.1, gymnasium>=0.29.1
+tensorboard>=2.15.0, scipy>=1.11.0, onnxruntime>=1.16.0
+```
+
+`onnxruntime` IS available. `sb3-contrib` is NOT listed — do not rely on it at inference time.
 
 ---
 
@@ -502,6 +573,26 @@ No. League Training is the mechanism for combining knowledge across model versio
   }
 
 ### 2026-05-24 08:46 — Auto-compact snapshot
+  {
+    "session_id": "172dfe2f-1195-4ec7-b47d-1751357f98e5",
+    "transcript_path": "/Users/luuvanson/.claude/projects/-Users-luuvanson-Desktop-redqueen/172dfe2f-1195-4ec7-b47d-1751357f98e5.jsonl",
+    "cwd": "/Users/luuvanson/Desktop/redqueen",
+    "hook_event_name": "PreCompact",
+    "trigger": "manual",
+    "custom_instructions": ""
+  }
+
+### 2026-05-25 22:38 — Auto-compact snapshot
+  {
+    "session_id": "172dfe2f-1195-4ec7-b47d-1751357f98e5",
+    "transcript_path": "/Users/luuvanson/.claude/projects/-Users-luuvanson-Desktop-redqueen/172dfe2f-1195-4ec7-b47d-1751357f98e5.jsonl",
+    "cwd": "/Users/luuvanson/Desktop/redqueen",
+    "hook_event_name": "PreCompact",
+    "trigger": "auto",
+    "custom_instructions": null
+  }
+
+### 2026-05-25 23:12 — Auto-compact snapshot
   {
     "session_id": "172dfe2f-1195-4ec7-b47d-1751357f98e5",
     "transcript_path": "/Users/luuvanson/.claude/projects/-Users-luuvanson-Desktop-redqueen/172dfe2f-1195-4ec7-b47d-1751357f98e5.jsonl",

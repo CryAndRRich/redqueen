@@ -63,17 +63,21 @@ PPO_DEFAULTS: dict = {
     "gamma":           0.995,
     "gae_lambda":      0.95,
     "clip_range":      0.2,
-    "ent_coef":        0.01,
+    "ent_coef":        0.02,
     "vf_coef":         0.5,
     "max_grad_norm":   0.5,
 }
 
-# Curriculum stages: (opponent_fn_name, n_envs_that_advance_after_winrate, winrate_threshold)
+# Curriculum stages: (opponent_fn_name, avg_rank_threshold)
+# avg_rank: 0=win, 1=2nd, 2=3rd, 3=died early — lower is better.
+# Agent must achieve avg_rank <= threshold for `patience` consecutive windows to advance.
 CURRICULUM_STAGES = [
-    ("random",     0.60),   # Stage 0: 3 random opponents
-    ("simple",     0.60),   # Stage 1: 3 simple rule agents
-    ("genius_nobomb", 0.60),# Stage 2: 3 genius agents (bomb disabled)
-    ("genius",     0.55),   # Stage 3: 3 full genius agents
+    ("random",   1.0),   # Stage 0: 3 random opponents — warm-up
+    ("simple",   1.5),   # Stage 1: 3 simple rule agents — basic danger avoidance
+    ("smarter",  1.8),   # Stage 2: 3 smarter agents — BFS-aware bridge stage
+    ("tactical", 2.0),   # Stage 3: 3 tactical agents — primary leaderboard target
+    ("trapper",  2.0),   # Stage 4: 3 trapper agents — kill-hunters (attack defence)
+    ("genius",   2.0),   # Stage 5: 3 genius agents — hardest baseline
 ]
 
 
@@ -83,28 +87,28 @@ CURRICULUM_STAGES = [
 
 def _make_opponents(stage_name: str, opp_ids: list[int]):
     """Return list of 3 opponent agents for a given curriculum stage."""
-    from agent import GeniusRuleAgent, SimpleRuleAgent, RandomAgent
+    from agent import (
+        GeniusRuleAgent, TacticalRuleAgent, TrapperRuleAgent,
+        SmarterRuleAgent, SimpleRuleAgent, RandomAgent,
+    )
 
     if stage_name == "random":
         return [RandomAgent(i) for i in opp_ids]
     if stage_name == "simple":
         return [SimpleRuleAgent(i) for i in opp_ids]
-    if stage_name == "genius_nobomb":
-        return [GeniusRuleAgent(i) for i in opp_ids]  # wrapped by _NoBombWrapper in _make_env_fn
+    if stage_name == "smarter":
+        return [SmarterRuleAgent(i) for i in opp_ids]
+    if stage_name == "tactical":
+        return [TacticalRuleAgent(i) for i in opp_ids]
+    if stage_name == "trapper":
+        return [TrapperRuleAgent(i) for i in opp_ids]
     if stage_name == "genius":
         return [GeniusRuleAgent(i) for i in opp_ids]
+    # Mixed opponent sets for flexible use
+    if stage_name == "mixed_t_g":
+        # 2 tactical + 1 genius — harder than pure tactical, softer than pure genius
+        return [TacticalRuleAgent(opp_ids[0]), TacticalRuleAgent(opp_ids[1]), GeniusRuleAgent(opp_ids[2])]
     raise ValueError(f"Unknown stage: {stage_name}")
-
-
-class _NoBombWrapper:
-    """Thin wrapper that prevents an agent from placing bombs."""
-    def __init__(self, inner):
-        self._inner = inner
-        self.agent_id = inner.agent_id
-
-    def act(self, obs):
-        action = self._inner.act(obs)
-        return action if action != 5 else 0
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -118,8 +122,6 @@ def _make_env_fn(stage_name: str, seed: int, agent_id: int = 0) -> Callable:
         all_ids = list(range(4))
         all_ids.remove(agent_id)
         opps = _make_opponents(stage_name, all_ids)
-        if stage_name == "genius_nobomb":
-            opps = [_NoBombWrapper(o) for o in opps]
         env = SingleAgentBomberEnv(opponents=opps, agent_id=agent_id, seed=seed)
         return env
     return _factory
@@ -140,9 +142,9 @@ def _make_self_play_env_fn(
 
         snapshots = sorted(snapshot_dir.glob("*.pt"))
         if not snapshots:
-            # Fall back to genius if no snapshots yet
-            from agent import GeniusRuleAgent
-            opps = [GeniusRuleAgent(i) for i in all_ids]
+            # Diverse fallback before any snapshots exist: mix tactical + genius
+            from agent import GeniusRuleAgent, TacticalRuleAgent, TrapperRuleAgent
+            opps = [TrapperRuleAgent(all_ids[0]), TacticalRuleAgent(all_ids[1]), GeniusRuleAgent(all_ids[2])]
         else:
             # Exponential-decay weighted sampling (recent snapshots preferred)
             weights = np.array([0.9 ** i for i in range(len(snapshots) - 1, -1, -1)])
@@ -225,49 +227,53 @@ class PastAgentWrapper:
 
 class CurriculumAdvanceCallback:
     """
-    Checks win rate after every learn() call.
-    If win_rate >= threshold for `patience` consecutive windows, advance stage.
+    Checks average rank after every learn() call.
+    Rank: 0=win (sole survivor), 1=2nd, 2=3rd, 3=died early — lower is better.
+    If avg_rank <= threshold for `patience` consecutive windows, advance stage.
     """
 
     def __init__(
         self,
         eval_env_fn: Callable,
         n_eval_episodes: int = 100,
-        win_rate_threshold: float = 0.60,
+        rank_threshold: float = 1.5,
         patience: int = 3,
     ) -> None:
         self.eval_env_fn = eval_env_fn
         self.n_eval_episodes = n_eval_episodes
-        self.threshold = win_rate_threshold
+        self.threshold = rank_threshold
         self.patience = patience
         self._consecutive = 0
 
     def evaluate(self, model) -> float:
-        """Run n_eval_episodes, return win rate."""
+        """Run n_eval_episodes, return average rank (lower is better)."""
         env = self.eval_env_fn()
-        wins = 0
+        total_rank = 0
         for ep in range(self.n_eval_episodes):
             obs, _ = env.reset(seed=ep)
             done = False
             while not done:
                 mask = env.action_masks()
                 action, _ = model.predict(obs, action_masks=mask, deterministic=True)
-                obs, _, terminated, truncated, info = env.step(int(action))
+                obs, _, terminated, truncated, _ = env.step(int(action))
                 done = terminated or truncated
-            # Check if our agent survived (win if last alive)
             raw = env.raw_obs
             if raw is not None:
                 alive = [int(raw["players"][i][2]) for i in range(4)]
-                if alive[0] == 1 and sum(alive) == 1:
-                    wins += 1
+                n_alive = sum(alive)
+                # rank 0=win (sole survivor), 1=2nd place, ..., 3=died early
+                rank = n_alive - 1 if alive[0] else 3
+            else:
+                rank = 3
+            total_rank += rank
         env.close()
-        return wins / self.n_eval_episodes
+        return total_rank / self.n_eval_episodes
 
     def check(self, model) -> bool:
         """Return True if curriculum should advance."""
-        wr = self.evaluate(model)
-        print(f"  Win rate: {wr:.2%}")
-        if wr >= self.threshold:
+        avg_rank = self.evaluate(model)
+        print(f"  Avg rank: {avg_rank:.2f} (threshold ≤ {self.threshold:.1f})")
+        if avg_rank <= self.threshold:
             self._consecutive += 1
         else:
             self._consecutive = 0
@@ -306,7 +312,7 @@ def train_curriculum(
 
     model = None
     for stage_idx, (stage_name, wr_thresh) in enumerate(CURRICULUM_STAGES):
-        print(f"\n=== Curriculum Stage {stage_idx}: {stage_name} (threshold {wr_thresh:.0%}) ===")
+        print(f"\n=== Curriculum Stage {stage_idx}: {stage_name} (avg_rank threshold ≤ {wr_thresh:.1f}) ===")
 
         env_fns = [_make_env_fn(stage_name, seed=stage_idx * 1000 + i) for i in range(n_envs)]
         vec_env = SubprocVecEnv(env_fns)
@@ -333,7 +339,7 @@ def train_curriculum(
         eval_fn = _make_env_fn(stage_name, seed=9999)
         cb = CurriculumAdvanceCallback(
             eval_fn, n_eval_episodes=100,
-            win_rate_threshold=wr_thresh, patience=3,
+            rank_threshold=wr_thresh, patience=3,
         )
 
         steps_done = 0

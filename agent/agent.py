@@ -22,7 +22,12 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import onnxruntime as ort
+
+try:
+    import onnxruntime as ort
+    _HAS_ORT = True
+except ImportError:
+    _HAS_ORT = False
 
 # ═══════════════════════════════════════════════════════════════════════════ #
 #  INLINED CONSTANTS                                                           #
@@ -263,19 +268,27 @@ class Agent:
 
     def __init__(self, agent_id: int) -> None:
         self.agent_id = int(agent_id)
+        _dir = Path(__file__).parent
 
-        # Locate model.onnx next to this file
-        model_path = Path(__file__).parent / "model.onnx"
-        if not model_path.exists():
+        onnx_path = _dir / "model.onnx"
+        pt_path   = _dir / "model.pt"
+
+        if _HAS_ORT and onnx_path.exists():
+            self._sess = ort.InferenceSession(
+                str(onnx_path),
+                providers=["CPUExecutionProvider"],
+            )
+            self._backend = "onnx"
+        elif pt_path.exists():
+            import torch
+            self._ts_model = torch.jit.load(str(pt_path), map_location="cpu")
+            self._ts_model.eval()
+            self._backend = "torch"
+        else:
             raise FileNotFoundError(
-                f"model.onnx not found at {model_path}. "
+                f"Neither model.onnx nor model.pt found in {_dir}. "
                 "Export with: python -m src.utils.export_onnx --checkpoint <ckpt>"
             )
-
-        self._sess = ort.InferenceSession(
-            str(model_path),
-            providers=["CPUExecutionProvider"],
-        )
 
         # Per-game state
         self._step: int = 0
@@ -330,14 +343,21 @@ class Agent:
             my_boxes_destroyed=self._my_boxes,
         )
 
-        # ── ONNX inference ────────────────────────────────────────────── #
-        logits: np.ndarray = self._sess.run(
-            None,
-            {
-                "spatial": spatial[np.newaxis],   # (1, 15, 13, 13)
-                "aux":     aux[np.newaxis],        # (1, 7)
-            },
-        )[0][0]  # shape (6,)
+        # ── Inference ─────────────────────────────────────────────────── #
+        if self._backend == "onnx":
+            logits: np.ndarray = self._sess.run(
+                None,
+                {
+                    "spatial": spatial[np.newaxis],   # (1, 15, 13, 13)
+                    "aux":     aux[np.newaxis],        # (1, 7)
+                },
+            )[0][0]  # shape (6,)
+        else:
+            import torch
+            with torch.no_grad():
+                sp_t = torch.from_numpy(spatial[np.newaxis])
+                ax_t = torch.from_numpy(aux[np.newaxis])
+                logits = self._ts_model(sp_t, ax_t).numpy()[0]  # shape (6,)
 
         # ── Action masking ────────────────────────────────────────────── #
         mask = _compute_mask(obs, self.agent_id)

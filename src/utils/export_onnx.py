@@ -178,11 +178,58 @@ def _benchmark(
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
+# TorchScript export (fallback for environments without onnxruntime)           #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def export_torchscript(
+    checkpoint_path: Path,
+    output_path: Path,
+) -> Path:
+    """
+    Load BomberPolicyNet from checkpoint and export to TorchScript via torch.jit.trace.
+
+    The traced module takes (spatial, aux) and returns logits, identical to the
+    _PolicyONNXWrapper interface — so agent.py can load it with torch.jit.load.
+
+    Args:
+        checkpoint_path: .pt file with model_state_dict
+        output_path:     destination .pt TorchScript file
+
+    Returns:
+        Path to the exported TorchScript file
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading checkpoint for TorchScript export: {checkpoint_path}")
+    net = BomberPolicyNet.load(str(checkpoint_path), device="cpu")
+    net.eval()
+    wrapper = _PolicyONNXWrapper(net)
+    wrapper.eval()
+
+    dummy_spatial = torch.zeros(1, 15, 13, 13, dtype=torch.float32)
+    dummy_aux     = torch.zeros(1, 7,       dtype=torch.float32)
+
+    print(f"Tracing to TorchScript: {output_path} …")
+    traced = torch.jit.trace(wrapper, (dummy_spatial, dummy_aux))
+    torch.jit.save(traced, str(output_path))
+    print(f"TorchScript saved: {output_path}  ({output_path.stat().st_size / 1024:.1f} KB)")
+
+    # Quick sanity check
+    loaded = torch.jit.load(str(output_path), map_location="cpu")
+    with torch.no_grad():
+        out = loaded(dummy_spatial, dummy_aux)
+    assert out.shape == (1, 6), f"Unexpected output shape: {out.shape}"
+    print("TorchScript verification PASSED ✓")
+
+    return output_path
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
 # CLI                                                                          #
 # ─────────────────────────────────────────────────────────────────────────── #
 
 def _cli() -> None:
-    parser = argparse.ArgumentParser(description="Export BomberPolicyNet to ONNX")
+    parser = argparse.ArgumentParser(description="Export BomberPolicyNet to ONNX and/or TorchScript")
     parser.add_argument(
         "--checkpoint", type=Path, required=True,
         help="Path to .pt checkpoint",
@@ -192,8 +239,10 @@ def _cli() -> None:
         default=None,
         help="Output .onnx path (default: exports/<checkpoint_name>.onnx)",
     )
-    parser.add_argument("--opset",     type=int,  default=17)
-    parser.add_argument("--no-verify", action="store_true")
+    parser.add_argument("--opset",          type=int,  default=17)
+    parser.add_argument("--no-verify",      action="store_true")
+    parser.add_argument("--torchscript",    action="store_true",
+                        help="Also export a TorchScript .pt file alongside the ONNX model")
     args = parser.parse_args()
 
     if args.output is None:
@@ -205,6 +254,13 @@ def _cli() -> None:
         opset=args.opset,
         verify=not args.no_verify,
     )
+
+    if args.torchscript:
+        ts_output = args.output.with_suffix(".pt")
+        export_torchscript(
+            checkpoint_path=args.checkpoint,
+            output_path=ts_output,
+        )
 
 
 if __name__ == "__main__":

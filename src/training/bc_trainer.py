@@ -212,11 +212,14 @@ def train_bc(
     # ── Training ─────────────────────────────────────────────────── #
     best_val_loss = float("inf")
     best_ckpt: Path = output_dir / "bc_best.pt"
+    early_stop_patience = 5
+    epochs_no_improve = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss = 0.0
         correct = 0
+        n_processed = 0  # actual samples seen (guards against DataLoader drop_last edge cases)
 
         for sp, aux, act, mask in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False):
             sp   = sp.to(dev)
@@ -232,27 +235,32 @@ def train_bc(
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            train_loss += loss.item() * len(act)
-            correct += (logits.argmax(dim=1) == act).sum().item()
+            batch_n = len(act)
+            train_loss += loss.item() * batch_n
+            correct    += (logits.argmax(dim=1) == act).sum().item()
+            n_processed += batch_n
 
         scheduler.step()
-        train_loss /= train_n
-        train_acc   = correct / train_n
+        train_loss /= n_processed
+        train_acc   = correct / n_processed
 
         # ── Validation ───────────────────────────────────────────── #
         model.eval()
         val_loss = 0.0
         val_correct = 0
+        n_val_processed = 0
         with torch.no_grad():
             for sp, aux, act, mask in val_loader:
                 sp, aux, act, mask = sp.to(dev), aux.to(dev), act.to(dev), mask.to(dev)
                 logits = model.get_action_logits(sp, aux)
                 loss = masked_focal_loss(logits, act, mask, gamma=gamma_focal)
-                val_loss += loss.item() * len(act)
+                batch_n = len(act)
+                val_loss    += loss.item() * batch_n
                 val_correct += (logits.argmax(dim=1) == act).sum().item()
+                n_val_processed += batch_n
 
-        val_loss /= val_n
-        val_acc   = val_correct / val_n
+        val_loss /= n_val_processed
+        val_acc   = val_correct / n_val_processed
 
         print(
             f"Epoch {epoch:3d} | "
@@ -271,8 +279,15 @@ def train_bc(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_no_improve = 0
             torch.save({"model_state_dict": model.state_dict(), "epoch": epoch,
                         "val_loss": val_loss, "val_acc": val_acc}, best_ckpt)
+            print(f"  → New best: {best_val_loss:.4f}")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= early_stop_patience:
+                print(f"\nEarly stopping at epoch {epoch} (no improvement for {early_stop_patience} epochs)")
+                break
 
     print(f"\nBest val loss: {best_val_loss:.4f} → {best_ckpt}")
     return best_ckpt
