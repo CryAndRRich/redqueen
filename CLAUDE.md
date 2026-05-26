@@ -1,6 +1,6 @@
 # CLAUDE.md — RedQueen AI Agent System
 > Auto-updated before each conversation compact via PreCompact hook.
-> Last manual update: 2026-05-24
+> Last manual update: 2026-05-26
 
 ---
 
@@ -300,90 +300,108 @@ Scalars 5–6 require external stat tracking (not in raw obs). Use `0.0` during 
 
 ---
 
-## 7. Reward Function (v2 — Tie-break Aware)
+## 7. Reward Function (v3 — Tie-break + Game-mechanics Aware)
 
-**File**: `agent/dqn_agent/reward.py` (for DQN legacy) and `src/training/reward_v2.py` (for PPO).
+**File**: `src/training/reward_v2.py` (contains v3 logic).
 
 ### Reward Table
 
 ```python
-REWARD_V2 = {
+REWARDS = {
     # === TERMINAL ===
-    "win":              3.0,    # last agent standing
-    "agent_death":     -2.0,    # own death (immediate return)
+    "win":                  3.0,    # last agent standing (also triggered on last kill)
+    "agent_death":         -2.0,    # own death (immediate return)
 
-    # === TIE-BREAK STATS (in priority order) ===
-    "kill_credit":      1.5,    # confirmed kill of enemy
-    "box_destroyed":    0.4,    # per box confirmed destroyed by MY bomb
-    "item_collected":   0.15,   # picking up radius or capacity item
-    "bomb_placed":      0.003,  # placing a bomb (tie-break #4 padding)
+    # === TIE-BREAK STATS (priority order: kills > boxes > items > bombs) ===
+    "kill_credit":          2.0,    # confirmed kill; last-kill bonus: +win if enemies=0
+    "box_destroyed":        0.4,    # per box destroyed by MY bomb (correctly attributed)
+    "item_collected":       0.3,    # picking up radius or capacity item
+    "bomb_placed":          0.003,  # placing a bomb (tie-break #4 padding)
+
+    # === TACTICAL BONUSES ===
+    "chain_reaction":       0.3,    # placing bomb adjacent to another active bomb (timer≤4)
+    "item_contest":         0.1,    # moving toward item that an enemy is also approaching
 
     # === DANGER SHAPING ===
-    "danger_evasion":   0.12,   # leaving blast zone (urgency multiplier ×1.5 if timer ≤ 3)
-    "danger_enter":    -0.08,   # stepping INTO blast zone voluntarily
-    "own_blast_loiter":-0.04,   # standing in own bomb blast (× (8-timer) urgency)
+    "danger_evasion":       0.12,   # leaving blast zone (urgency ×1.5 if timer ≤ 3)
+    "danger_enter":        -0.08,   # stepping INTO blast zone voluntarily
+    "own_blast_loiter":    -0.04,   # standing in own bomb blast (× (8-timer) urgency)
 
     # === MOVEMENT ===
-    "survival_step":    0.005,  # alive bonus per step (encourage surviving)
-    "standing_still":  -0.008,  # repeated STOP actions
-    "time_penalty":    -0.003,  # small time cost to prevent infinite games
+    "survival_step":        0.005,  # alive bonus per step
+    "standing_still":      -0.008,  # repeated STOP actions
+    "time_penalty":        -0.003,  # small time cost to prevent infinite games
 
-    # === ENEMY PRESSURE (reduced from v1 — dangerous in FFA) ===
-    "approach_enemy":   0.006,  # × (prev_dist - curr_dist); was 0.02, reduced
+    # === ENEMY PRESSURE (FFA-safe — do not raise) ===
+    "approach_enemy":       0.006,  # × (prev_dist - curr_dist)
 }
 ```
 
-### Key changes from v1
+### Key changes from v2 → v3
 
-| Change | v1 | v2 | Reason |
+| Change | v2 | v3 | Reason |
 |--------|----|----|--------|
-| `kill_credit` | 1.0 (`enemy_death`) | **1.5** | Kill is tie-break #1 |
-| `box_destroyed` | None | **+0.4** | Tie-break #2, confirmed (not proxy) |
-| `plant_near_box` | +0.05 | **Removed** | Misleading proxy — plant != destroy |
-| `bomb_placed` | None | **+0.003** | Tie-break #4, minimal |
-| `approach_enemy` | 0.02 | **0.006** | Dangerous in 4-player FFA |
-| `survival_step` | None | **+0.005/step** | Explicit survival signal |
+| `kill_credit` | 1.5 | **2.0** | Last kill grants win bonus (enemies=0 → +3.0) |
+| `item_collected` | 0.15 | **0.3** | Tie-break #3 was underweighted |
+| `chain_reaction` | — | **+0.3** | Chain kills = boxes + multi-kill synergy |
+| `item_contest` | — | **+0.1** | Simultaneous collection destroys item |
+| Box attribution | all boxes | **my bombs only** | Enemy bomb boxes gave false credit |
 
-### Box destruction detection
+### Box destruction attribution (CRITICAL — fixed in v3)
 ```python
-# In compute_reward: compare grid between frames
-prev_boxes = (prev_obs["map"] == 2)
-curr_boxes = (curr_obs["map"] == 2)
-destroyed_tiles = prev_boxes & ~curr_boxes  # boxes that disappeared
-# Check if destroyed tile was in MY bomb's blast zone
+# Only credit boxes destroyed by MY bombs with timer==1 in prev_obs.
+# timer==1 → decrements to 0 → explodes → boxes gone in curr_obs.
+for row in prev_bombs:
+    bx, by, timer, owner = ...
+    if owner != agent_id or timer != 1:
+        continue
+    blast = _blast_tiles(grid, bx, by, radius)
+    for tx, ty in blast:
+        if prev_grid[tx, ty] == BOX and curr_grid[tx, ty] != BOX:
+            my_boxes_destroyed += 1
 ```
 
 ---
 
-## 8. Training Pipeline (v2)
+## 8. Training Pipeline (v3 — 7-Stage Curriculum)
 
 ```
-Phase 0  History Mining     MỚI — Extract BC data from history_game/
+Phase 0  History Mining     Extract BC data from history_game/
   └─ Parser: src/training/history_parser.py
   └─ Filter: rank=0 AND survival≥120 AND bombs_placed≥5
-  └─ Sources: baseline winners + top participant UUIDs (f9f492f0, cd455db7)
+  └─ Sources: top participant UUIDs (f9f492f0, cd455db7)
   └─ Estimated yield: 40,000–80,000 quality (obs, action) pairs
+  └─ Fallback: GeniusRuleAgent self-rollout (5,000 games ≈ 650k transitions)
 
-Phase 1  GeniusRuleAgent    Teacher for self-rollout demos + opponent in Phase 3 curriculum
-  └─ Also run 10,000 self-rollout games to augment Phase 0 data
-
-Phase 2  Behavioral Cloning Supervised from Phase 0+1 data
-  └─ Feature: 15-channel (Section 6) + 7 aux scalars
+Phase 2  Behavioral Cloning Supervised from Phase 0 data
+  └─ Feature: 15-channel spatial + 7 aux scalars
   └─ Action Masking ACTIVE from this phase onward
-  └─ Loss: Focal loss (γ=2) to handle class imbalance (PLACE_BOMB is rare ~15%)
+  └─ Loss: Focal loss (γ=2) to handle class imbalance (PLACE_BOMB ~15%)
+  └─ Early stopping: patience=5 epochs, no val_loss improvement
   └─ Checkpoint: bc_{epoch}ep_{timestamp}.pt
 
-Phase 3  PPO + Curriculum   RL fine-tune from BC init
+Phase 3  PPO + 7-Stage Curriculum   RL fine-tune from BC init
   └─ Action Masking: ACTIVE, hard-coded
-  └─ Reward: v2 (tie-break aware)
-  └─ SubprocVecEnv: 8 parallel environments
-  └─ Curriculum: Random(3) → Simple(3) → Genius(3) NoBomb → Genius(3) Full
-  └─ Advance stage when: win_rate > 60% for 3 consecutive eval windows (100 games each)
+  └─ Reward: v3 (tie-break aware, correct box attribution)
+  └─ SubprocVecEnv: 4–8 parallel environments
+  └─ ent_coef schedule: 0.08 → 0.06 → 0.06 → 0.05 → 0.05 → 0.04 → 0.03
+     (Stage 0 = 0.08 to undo BC determinism; previous 0.03 caused entropy collapse)
+  └─ 20% random opponent mixing per training env (prevents co-adaptation)
+  └─ Curriculum stages (min 200k steps each, eval every 50k over 200 games):
+       Stage 0: random          avg_rank ≤ 0.8
+       Stage 1: simple          avg_rank ≤ 1.2
+       Stage 2: simple_smarter1 avg_rank ≤ 1.5  ← BRIDGE (1 Smarter + 2 Simple)
+       Stage 3: smarter         avg_rank ≤ 1.8  (2 Smarter + 1 Simple anchor)
+       Stage 4: tactical        avg_rank ≤ 2.0  (2 Tactical + 1 Smarter anchor)
+       Stage 5: trapper         avg_rank ≤ 2.0  (2 Trapper + 1 Tactical anchor)
+       Stage 6: genius          avg_rank ≤ 2.0  (2 Genius + 1 Tactical anchor)
+  └─ Advance when: avg_rank ≤ threshold for 3 consecutive windows AND min 200k steps
+  └─ Worsening guard: rank delta > 0.15 over 3 evals resets consecutive counter
   └─ Checkpoint: ppo_{step}_{timestamp}.pt
 
 Phase 4  Continuous Self-Play  PPO vs rolling Past Agents pool
-  └─ Snapshot every 50k steps → Past Agents
-  └─ Sample weights: exponential decay (α=0.9^age) — favor recent agents
+  └─ Snapshot every 50k steps → Past Agents pool
+  └─ Sample weights: exponential decay (α=0.9^age) — favor recent snapshots
   └─ Pool size: keep latest 20 snapshots
   └─ Checkpoint: selfplay_{step}_{timestamp}.pt
 
@@ -398,29 +416,44 @@ Phase 5  League Training   Full league with 4-player matchmaking
 
 ```python
 PPO_DEFAULTS = {
-    "learning_rate":    3e-4,
-    "n_steps":          2048,     # per env per rollout
-    "batch_size":       256,
-    "n_epochs":         10,
-    "gamma":            0.995,    # high gamma — reward is delayed (bomb timer = 7)
-    "gae_lambda":       0.95,
-    "clip_range":       0.2,
-    "ent_coef":         0.01,     # entropy: prevent premature convergence
-    "vf_coef":          0.5,
-    "max_grad_norm":    0.5,
-    "n_envs":           8,        # SubprocVecEnv parallel
+    "learning_rate":   3e-4,
+    "n_steps":         2048,     # per env per rollout
+    "batch_size":      256,
+    "n_epochs":        10,
+    "gamma":           0.995,    # high gamma — bomb timer = 7 steps delay
+    "gae_lambda":      0.95,
+    "clip_range":      0.2,
+    "ent_coef":        0.03,     # base; overridden by STAGE_ENT_COEF at runtime
+    "vf_coef":         0.5,
+    "max_grad_norm":   0.5,
 }
+
+# Per-stage ent_coef (applied at stage start, overrides PPO_DEFAULTS):
+STAGE_ENT_COEF = [0.08, 0.06, 0.06, 0.05, 0.05, 0.04, 0.03]
+# Stage 0 = 0.08: high entropy required to undo BC-pretraining determinism.
+# Previous value 0.03 caused entropy collapse (entropy_loss -1.16 → -0.30 in Stage 1).
+# Source: Costa 2021 "32 Details of PPO"; Meishner et al. 2019 (arXiv:1911.04947).
 ```
 
 ### Pipeline Summary Table
 
 | Phase | Script | Key Flag | Checkpoint |
 |-------|--------|----------|-----------|
-| 0 | `history_parser.py` | `--extract` | `data/bc_dataset.npz` |
+| 0 | `history_parser.py` | `--extract` | `data/bc_dataset/` |
 | 2 | `bc_trainer.py` | `--train` | `bc_{epoch}ep_{ts}.pt` |
 | 3 | `ppo_trainer.py` | `--curriculum` | `ppo_{step}_{ts}.pt` |
 | 4 | `ppo_trainer.py` | `--self-play` | `selfplay_{step}_{ts}.pt` |
 | 5 | `league_trainer.py` | `--league` | `league_{step}_{ts}.pt` |
+
+### Why the Bridge Stage Was Added (Stage 2: simple_smarter1)
+
+Observed training failure (old 6-stage curriculum):
+- Stage 1 (simple): avg_rank improved to 1.15 → advanced
+- Stage 2 (smarter, old): avg_rank immediately collapsed to 2.46 → 2.58
+
+Root cause: The jump from 3×SimpleRuleAgent to 2×SmarterRuleAgent+1×Simple was too large.
+The bridge stage (1 Smarter + 2 Simple, threshold=1.5) smooths this transition.
+Source: Territory Paint Wars (arXiv:2604.04983) — large opponent jumps cause policy collapse.
 
 ---
 
@@ -593,6 +626,52 @@ No. League Training is the mechanism for combining knowledge across model versio
   }
 
 ### 2026-05-25 23:12 — Auto-compact snapshot
+  {
+    "session_id": "172dfe2f-1195-4ec7-b47d-1751357f98e5",
+    "transcript_path": "/Users/luuvanson/.claude/projects/-Users-luuvanson-Desktop-redqueen/172dfe2f-1195-4ec7-b47d-1751357f98e5.jsonl",
+    "cwd": "/Users/luuvanson/Desktop/redqueen",
+    "hook_event_name": "PreCompact",
+    "trigger": "manual",
+    "custom_instructions": ""
+  }
+
+### 2026-05-26 09:16 — Auto-compact snapshot
+  {
+    "session_id": "172dfe2f-1195-4ec7-b47d-1751357f98e5",
+    "transcript_path": "/Users/luuvanson/.claude/projects/-Users-luuvanson-Desktop-redqueen/172dfe2f-1195-4ec7-b47d-1751357f98e5.jsonl",
+    "cwd": "/Users/luuvanson/Desktop/redqueen",
+    "hook_event_name": "PreCompact",
+    "trigger": "auto",
+    "custom_instructions": null
+  }
+
+### 2026-05-26 — Training diagnostics + curriculum v3
+
+**Root causes identified from Kaggle training logs (entropy collapse + Stage 2 collapse):**
+- `ent_coef=0.03` insufficient to undo BC-pretraining determinism → entropy_loss -1.16→-0.30
+- Stage 1→2 jump too large (3×Simple → 2×Smarter): avg_rank collapsed 2.46→2.58
+- Box destruction reward credited ALL boxes, not just agent's own → noisy credit signal
+
+**Fixes applied (ppo_trainer.py + reward_v2.py):**
+- `STAGE_ENT_COEF = [0.08, 0.06, 0.06, 0.05, 0.05, 0.04, 0.03]` — Stage 0 now 0.08
+- Stage 0 now applies `STAGE_ENT_COEF[0]` (was using PPO_DEFAULTS directly)
+- Added bridge Stage 2 `"simple_smarter1"` (1 Smarter + 2 Simple, threshold=1.5)
+  → curriculum is now 7 stages instead of 6
+- 20% random opponent mixing in training envs (prevents co-adaptation)
+- Box attribution fixed: only count boxes in blast zone of MY bombs with timer==1
+
+**Reward v3 updates (reward_v2.py):**
+- `kill_credit`: 1.5 → 2.0; last kill triggers `win` bonus (enemies=0)
+- `item_collected`: 0.15 → 0.3 (tie-break #3 was underweighted)
+- Added `chain_reaction: +0.3` and `item_contest: +0.1`
+- Box destruction now correctly attributed to MY bombs only
+
+**Notebook updated (train_on_kaggle.ipynb):**
+- Cell numbering: 1–10, sequential, no "3a/3b"
+- Cell 6 comment reflects 7-stage curriculum + ent_coef 0.08 schedule
+- Submission format corrected: model.pt (not requirements.txt)
+
+### 2026-05-26 09:35 — Auto-compact snapshot
   {
     "session_id": "172dfe2f-1195-4ec7-b47d-1751357f98e5",
     "transcript_path": "/Users/luuvanson/.claude/projects/-Users-luuvanson-Desktop-redqueen/172dfe2f-1195-4ec7-b47d-1751357f98e5.jsonl",

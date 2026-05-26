@@ -63,29 +63,35 @@ PPO_DEFAULTS: dict = {
     "gamma":           0.995,
     "gae_lambda":      0.95,
     "clip_range":      0.2,
-    "ent_coef":        0.02,
+    "ent_coef":        0.03,   # raised from 0.02: BC pretraining makes policy deterministic;
+                               # 0.02 causes entropy collapse within Stage 1 (entropy_loss -1.16→-0.58)
     "vf_coef":         0.5,
     "max_grad_norm":   0.5,
 }
 
 # Curriculum stages: (opponent_fn_name, avg_rank_threshold)
 # avg_rank: 0=win, 1=2nd, 2=3rd, 3=died early — lower is better.
-# Opponents include an anti-forgetting anchor (1 easier agent) from Stage 2 onward.
+# Opponents include an anti-forgetting anchor (1 easier agent) from Stage 3 onward.
+# Stage 2 is a bridge stage (1 Smarter + 2 Simple) that smooths the Simple→Smarter jump.
+# Without the bridge, Stage 1→2 is too large and causes avg_rank collapse (observed: 2.46→2.58).
 # Ref: IJCAI 2024 workshop — rule-based anchors prevent catastrophic forgetting.
+# Ref: Territory Paint Wars (arXiv:2604.04983) — large opponent jumps cause policy collapse.
 CURRICULUM_STAGES = [
-    ("random",   0.8),   # Stage 0: must dominate randoms (tightened from 1.0)
-    ("simple",   1.2),   # Stage 1: must clearly beat simple (tightened from 1.5)
-    ("smarter",  1.8),   # Stage 2: 2 smarter + 1 simple anchor
-    ("tactical", 2.0),   # Stage 3: 2 tactical + 1 smarter anchor
-    ("trapper",  2.0),   # Stage 4: 2 trapper + 1 tactical anchor
-    ("genius",   2.0),   # Stage 5: 2 genius + 1 tactical anchor
+    ("random",          0.8),   # Stage 0: must dominate randoms
+    ("simple",          1.2),   # Stage 1: must clearly beat simple
+    ("simple_smarter1", 1.5),   # Stage 2 (BRIDGE): 1 Smarter + 2 Simple — smooth transition
+    ("smarter",         1.8),   # Stage 3: 2 Smarter + 1 Simple anchor
+    ("tactical",        2.0),   # Stage 4: 2 Tactical + 1 Smarter anchor
+    ("trapper",         2.0),   # Stage 5: 2 Trapper + 1 Tactical anchor
+    ("genius",          2.0),   # Stage 6: 2 Genius + 1 Tactical anchor
 ]
 
-# ent_coef per stage: re-inject exploration when entering harder stages.
-# BC pretraining makes policy deterministic; entropy collapses fast during Stage 1.
-# Boosting ent_coef at Stage 2+ provides stronger gradient signal to maintain exploration.
-# Ref: Meishner et al. 2019; entropy scheduling literature.
-STAGE_ENT_COEF = [0.02, 0.02, 0.04, 0.04, 0.04, 0.04]
+# ent_coef per stage: start high (0.08) to undo BC determinism, anneal across stages.
+# BC pretraining drives policy toward near-deterministic distribution (low entropy).
+# ent_coef=0.03 was insufficient — entropy collapsed from -1.16→-0.30 within Stage 1.
+# Ref: Costa 2021 "32 Details of PPO" — entropy bonus is primary anti-collapse mechanism.
+# Ref: Meishner et al. 2019 (arXiv:1911.04947) — BC init requires elevated entropy pressure.
+STAGE_ENT_COEF = [0.08, 0.06, 0.06, 0.05, 0.05, 0.04, 0.03]
 
 # Minimum steps per stage regardless of win-rate threshold being met.
 # Prevents premature advancement before skills are consolidated.
@@ -97,8 +103,14 @@ MIN_STEPS_PER_STAGE = 200_000
 # Opponent factories                                                           #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-def _make_opponents(stage_name: str, opp_ids: list[int]):
-    """Return list of 3 opponent agents for a given curriculum stage."""
+def _make_opponents(stage_name: str, opp_ids: list[int], mix_random: bool = False):
+    """
+    Return list of 3 opponent agents for a given curriculum stage.
+
+    mix_random: if True, replace one opponent with RandomAgent with 20% probability.
+    This prevents co-adaptation with specific opponents (Territory Paint Wars, 2024).
+    Only applied to training envs, not evaluation envs.
+    """
     from agent import (
         GeniusRuleAgent, TacticalRuleAgent, TrapperRuleAgent,
         SmarterRuleAgent, SimpleRuleAgent, RandomAgent,
@@ -107,35 +119,48 @@ def _make_opponents(stage_name: str, opp_ids: list[int]):
     if stage_name == "random":
         return [RandomAgent(i) for i in opp_ids]
     if stage_name == "simple":
-        return [SimpleRuleAgent(i) for i in opp_ids]
-    if stage_name == "smarter":
+        opps = [SimpleRuleAgent(i) for i in opp_ids]
+    elif stage_name == "simple_smarter1":
+        # Bridge: 1 Smarter + 2 Simple — gradual introduction of stronger opponent
+        opps = [SmarterRuleAgent(opp_ids[0]), SimpleRuleAgent(opp_ids[1]), SimpleRuleAgent(opp_ids[2])]
+    elif stage_name == "smarter":
         # 2 smarter + 1 simple anchor — prevents forgetting Stage 1 survival skills
-        return [SmarterRuleAgent(opp_ids[0]), SmarterRuleAgent(opp_ids[1]), SimpleRuleAgent(opp_ids[2])]
-    if stage_name == "tactical":
+        opps = [SmarterRuleAgent(opp_ids[0]), SmarterRuleAgent(opp_ids[1]), SimpleRuleAgent(opp_ids[2])]
+    elif stage_name == "tactical":
         # 2 tactical + 1 smarter anchor
-        return [TacticalRuleAgent(opp_ids[0]), TacticalRuleAgent(opp_ids[1]), SmarterRuleAgent(opp_ids[2])]
-    if stage_name == "trapper":
+        opps = [TacticalRuleAgent(opp_ids[0]), TacticalRuleAgent(opp_ids[1]), SmarterRuleAgent(opp_ids[2])]
+    elif stage_name == "trapper":
         # 2 trapper + 1 tactical anchor
-        return [TrapperRuleAgent(opp_ids[0]), TrapperRuleAgent(opp_ids[1]), TacticalRuleAgent(opp_ids[2])]
-    if stage_name == "genius":
+        opps = [TrapperRuleAgent(opp_ids[0]), TrapperRuleAgent(opp_ids[1]), TacticalRuleAgent(opp_ids[2])]
+    elif stage_name == "genius":
         # 2 genius + 1 tactical anchor
-        return [GeniusRuleAgent(opp_ids[0]), GeniusRuleAgent(opp_ids[1]), TacticalRuleAgent(opp_ids[2])]
-    if stage_name == "mixed_t_g":
-        return [TacticalRuleAgent(opp_ids[0]), TacticalRuleAgent(opp_ids[1]), GeniusRuleAgent(opp_ids[2])]
-    raise ValueError(f"Unknown stage: {stage_name}")
+        opps = [GeniusRuleAgent(opp_ids[0]), GeniusRuleAgent(opp_ids[1]), TacticalRuleAgent(opp_ids[2])]
+    elif stage_name == "mixed_t_g":
+        opps = [TacticalRuleAgent(opp_ids[0]), TacticalRuleAgent(opp_ids[1]), GeniusRuleAgent(opp_ids[2])]
+    else:
+        raise ValueError(f"Unknown stage: {stage_name}")
+
+    # 20% random mixing: replace last opponent with RandomAgent.
+    # Prevents policy from overfitting to specific opponent behaviors (co-adaptation).
+    if mix_random and random.random() < 0.20:
+        opps[-1] = RandomAgent(opp_ids[-1])
+
+    return opps
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Environment factory                                                          #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-def _make_env_fn(stage_name: str, seed: int, agent_id: int = 0) -> Callable:
-    """Return a callable that creates a SingleAgentBomberEnv (for VecEnv)."""
+def _make_env_fn(stage_name: str, seed: int, agent_id: int = 0, mix_random: bool = False) -> Callable:
+    """Return a callable that creates a SingleAgentBomberEnv (for VecEnv).
+    mix_random=True for training envs only; always False for eval envs.
+    """
     def _factory():
         from src.wrappers.bomberland_env import SingleAgentBomberEnv
         all_ids = list(range(4))
         all_ids.remove(agent_id)
-        opps = _make_opponents(stage_name, all_ids)
+        opps = _make_opponents(stage_name, all_ids, mix_random=mix_random)
         env = SingleAgentBomberEnv(opponents=opps, agent_id=agent_id, seed=seed)
         return env
     return _factory
@@ -253,7 +278,7 @@ class CurriculumAdvanceCallback:
     def __init__(
         self,
         eval_env_fn: Callable,
-        n_eval_episodes: int = 100,
+        n_eval_episodes: int = 200,   # raised from 100: 4-player FFA has high variance
         rank_threshold: float = 1.5,
         patience: int = 3,
         min_steps: int = MIN_STEPS_PER_STAGE,
@@ -266,6 +291,7 @@ class CurriculumAdvanceCallback:
         self._consecutive = 0
         self._history: list[float] = []
         self._steps_in_stage: int = 0
+        self.stage_passed: bool = False
 
     def evaluate(self, model) -> float:
         """Run n_eval_episodes, return average rank (lower is better)."""
@@ -316,7 +342,8 @@ class CurriculumAdvanceCallback:
             print(f"  ⏳ Min steps not reached ({self._steps_in_stage:,}/{self.min_steps:,}), holding")
             return False
 
-        return self._consecutive >= self.patience
+        self.stage_passed = self._consecutive >= self.patience
+        return self.stage_passed
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -329,8 +356,15 @@ def train_curriculum(
     n_envs: int = 8,
     init_from: Path | None = None,
     device: str = "auto",
-) -> Path:
-    """Phase 3: curriculum PPO training."""
+) -> tuple[Path, bool]:
+    """
+    Phase 3: curriculum PPO training.
+
+    Returns:
+        (best_ckpt, all_stages_passed) — if a stage fails to meet threshold within
+        its budget, training stops immediately at that stage.
+        all_stages_passed=False means self-play should NOT be run.
+    """
     import warnings
     import torch
     from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -350,10 +384,14 @@ def train_curriculum(
     best_ckpt = output_dir / "ppo_curriculum_best.pt"
 
     model = None
+    all_stages_passed = True
+
     for stage_idx, (stage_name, wr_thresh) in enumerate(CURRICULUM_STAGES):
         print(f"\n=== Curriculum Stage {stage_idx}: {stage_name} (avg_rank threshold ≤ {wr_thresh:.1f}) ===")
 
-        env_fns = [_make_env_fn(stage_name, seed=stage_idx * 1000 + i) for i in range(n_envs)]
+        # Training envs use mix_random=True (20% random opponent substitution).
+        # Eval env uses mix_random=False for consistent, deterministic evaluation.
+        env_fns = [_make_env_fn(stage_name, seed=stage_idx * 1000 + i, mix_random=True) for i in range(n_envs)]
         vec_env = SubprocVecEnv(env_fns)
 
         if model is None:
@@ -372,20 +410,24 @@ def train_curriculum(
             )
             if init_from and init_from.exists():
                 _load_bc_into_sb3(model, init_from, device)
+            # Apply stage-specific ent_coef from Stage 0 — PPO_DEFAULTS ent_coef is
+            # too low to counteract BC-pretraining determinism (observed entropy collapse).
+            model.ent_coef = STAGE_ENT_COEF[stage_idx]
+            print(f"  ent_coef set to {STAGE_ENT_COEF[stage_idx]} for stage {stage_idx}")
         else:
             model.set_env(vec_env)
             # Re-inject exploration entropy when entering a harder stage.
-            # Entropy collapses during early stages (BC init → deterministic policy);
-            # boosting ent_coef provides gradient signal to re-open the action distribution.
             ent_coef = STAGE_ENT_COEF[stage_idx]
             model.ent_coef = ent_coef
             print(f"  ent_coef reset to {ent_coef} for stage {stage_idx}")
 
-        eval_fn = _make_env_fn(stage_name, seed=9999)
+        eval_fn = _make_env_fn(stage_name, seed=9999, mix_random=False)
         cb = CurriculumAdvanceCallback(
-            eval_fn, n_eval_episodes=100,
-            rank_threshold=wr_thresh, patience=3,
+            eval_fn,
+            rank_threshold=wr_thresh,
+            patience=3,
             min_steps=MIN_STEPS_PER_STAGE,
+            # n_eval_episodes uses default (200)
         )
 
         steps_done = 0
@@ -399,18 +441,29 @@ def train_curriculum(
 
             ts = time.strftime("%Y%m%d_%H%M%S")
             ckpt = output_dir / f"ppo_s{stage_idx}_{steps_done}steps_{ts}.pt"
-            # Save policy net weights separately for compatibility
             _save_sb3_weights(model, ckpt)
             print(f"  Saved {ckpt.name}")
 
             if cb.check(model, steps_this_iter=50_000):
-                print(f"  → Advancing to next stage!")
+                print(f"  → Stage {stage_name} passed! Advancing.")
                 break
 
         vec_env.close()
 
+        # If stage not passed: save current weights and STOP — no point training harder stages
+        if not cb.stage_passed:
+            best_rank = min(cb._history) if cb._history else float("nan")
+            print(
+                f"\n  ✗ Stage {stage_name} failed — best avg_rank {best_rank:.2f} "
+                f"never reached threshold {wr_thresh:.1f} within {steps_done:,} steps.\n"
+                f"  Stopping curriculum. Current checkpoint is the best available."
+            )
+            all_stages_passed = False
+            break  # do NOT advance to harder stages
+
     _save_sb3_weights(model, best_ckpt)
-    print(f"\nFinal curriculum checkpoint: {best_ckpt}")
+    status = "all stages passed ✓" if all_stages_passed else f"stopped at stage {stage_idx} ({stage_name}) ✗"
+    print(f"\nFinal curriculum checkpoint: {best_ckpt.name}  [{status}]")
     return best_ckpt
 
 

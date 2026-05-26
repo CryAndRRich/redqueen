@@ -196,12 +196,26 @@ def compute_reward(
             # Down to last enemy: killing this one is especially valuable
             reward += REWARDS["kill_credit"] * 0.5
 
-    # ── Confirmed box destruction ─────────────────────────────────────── #
+    # ── Confirmed box destruction (attributed to MY bombs only) ──────────── #
+    # Previous code counted ALL boxes destroyed — gave credit for enemy bomb explosions.
+    # Now: only credit boxes in blast zone of MY bombs that had timer==1 in prev_obs,
+    # because timer==1 → timer becomes 0 → explosion resolves this step.
     prev_grid = np.asarray(prev_obs["map"])
     curr_grid = np.asarray(curr_obs["map"])
-    boxes_destroyed = int(((prev_grid == BOX) & (curr_grid != BOX)).sum())
-    if boxes_destroyed:
-        reward += boxes_destroyed * REWARDS["box_destroyed"]
+    my_boxes_destroyed = 0
+    prev_bombs_arr = _parse_bombs(prev_obs["bombs"])
+    if prev_bombs_arr is not None:
+        for row in prev_bombs_arr:
+            bx, by, timer, owner = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+            if int(owner) != aid or int(timer) != 1:
+                continue  # only my bombs that explode this step
+            radius = 1 + int(prev_p[aid][4])
+            blast = _blast_tiles(prev_grid, bx, by, radius)
+            for tx, ty in blast:
+                if prev_grid[tx, ty] == BOX and curr_grid[tx, ty] != BOX:
+                    my_boxes_destroyed += 1
+    if my_boxes_destroyed > 0:
+        reward += my_boxes_destroyed * REWARDS["box_destroyed"]
 
     # ── Item collection ───────────────────────────────────────────────── #
     prev_radius = int(prev_p[aid][4])
