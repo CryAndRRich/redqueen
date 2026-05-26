@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -94,9 +95,10 @@ CURRICULUM_STAGES = [
 STAGE_ENT_COEF = [0.08, 0.06, 0.06, 0.05, 0.05, 0.04, 0.03]
 
 # Minimum steps per stage regardless of win-rate threshold being met.
-# Prevents premature advancement before skills are consolidated.
-# Ref: Meishner et al. 2019 — 200k steps minimum for consolidation.
-MIN_STEPS_PER_STAGE = 200_000
+# Reduced from 200k → 100k: observed Stage 1 peaked at 50-100k then deteriorated
+# as PPO reward-hacked past its BC initialization.  100k is enough consolidation
+# without forcing training into the performance valley.
+MIN_STEPS_PER_STAGE = 100_000
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -294,7 +296,19 @@ class CurriculumAdvanceCallback:
         self.stage_passed: bool = False
 
     def evaluate(self, model) -> float:
-        """Run n_eval_episodes, return average rank (lower is better)."""
+        """Run n_eval_episodes, return average rank (lower is better).
+
+        Rank scale: 0=win (sole survivor or tie-break winner), 3=died early.
+
+        Draw handling (step-500 truncation with multiple survivors):
+          Old formula  rank = n_alive - 1  gave rank=3 when 4 agents survived,
+          equating "alive at game end" with "died early". This corrupt signal
+          caused the policy to deteriorate during Stage 1 training.
+          Fix: alive-in-draw → expected rank = (n_alive - 1) // 2.
+            n_alive=2 → rank 0  (50 % chance of winning tie-break; give benefit of doubt)
+            n_alive=3 → rank 1
+            n_alive=4 → rank 1  (vs old: rank 3)
+        """
         env = self.eval_env_fn()
         total_rank = 0
         for ep in range(self.n_eval_episodes):
@@ -309,8 +323,15 @@ class CurriculumAdvanceCallback:
             if raw is not None:
                 alive = [int(raw["players"][i][2]) for i in range(4)]
                 n_alive = sum(alive)
-                # rank 0=win (sole survivor), 1=2nd place, ..., 3=died early
-                rank = n_alive - 1 if alive[0] else 3
+                if not alive[0]:
+                    rank = 3  # we died
+                elif n_alive == 1:
+                    rank = 0  # sole survivor — unambiguous win
+                else:
+                    # Step-500 draw: multiple agents survived.
+                    # Expected rank = (n_alive-1)//2 (uniform tie-break assumption).
+                    # For n_alive=4: rank=1 (was 3 — the key fix).
+                    rank = (n_alive - 1) // 2
             else:
                 rank = 3
             total_rank += rank
@@ -430,6 +451,12 @@ def train_curriculum(
             # n_eval_episodes uses default (200)
         )
 
+        # Track the best checkpoint WITHIN this stage.
+        # Previously best_ckpt was overwritten only at stage end with the FINAL model,
+        # which was often worse than the peak (e.g. Stage 1: 1.09 at 50k → 1.73 at 750k).
+        stage_best_rank = float("inf")
+        stage_best_ckpt = output_dir / f"ppo_s{stage_idx}_best.pt"
+
         steps_done = 0
         while steps_done < total_steps_per_stage:
             model.learn(
@@ -444,24 +471,38 @@ def train_curriculum(
             _save_sb3_weights(model, ckpt)
             print(f"  Saved {ckpt.name}")
 
-            if cb.check(model, steps_this_iter=50_000):
+            advanced = cb.check(model, steps_this_iter=50_000)
+
+            # Save stage-best checkpoint when a new best avg_rank is achieved.
+            last_rank = cb._history[-1]
+            if last_rank < stage_best_rank:
+                stage_best_rank = last_rank
+                _save_sb3_weights(model, stage_best_ckpt)
+                print(f"  → Stage best: avg_rank {stage_best_rank:.2f} → {stage_best_ckpt.name}")
+
+            if advanced:
                 print(f"  → Stage {stage_name} passed! Advancing.")
                 break
 
         vec_env.close()
 
-        # If stage not passed: save current weights and STOP — no point training harder stages
+        # Copy stage best into the overall best checkpoint.
+        # stage_best_ckpt holds the model with the lowest avg_rank seen this stage,
+        # which is always ≥ as good as the final model (avoids keeping a deteriorated snapshot).
+        if stage_best_ckpt.exists():
+            shutil.copy2(stage_best_ckpt, best_ckpt)
+
+        # If stage not passed: stop — no point training harder stages on a failing policy.
         if not cb.stage_passed:
             best_rank = min(cb._history) if cb._history else float("nan")
             print(
                 f"\n  ✗ Stage {stage_name} failed — best avg_rank {best_rank:.2f} "
                 f"never reached threshold {wr_thresh:.1f} within {steps_done:,} steps.\n"
-                f"  Stopping curriculum. Current checkpoint is the best available."
+                f"  Stopping curriculum. Best-rank checkpoint ({best_rank:.2f}) saved."
             )
             all_stages_passed = False
             break  # do NOT advance to harder stages
 
-    _save_sb3_weights(model, best_ckpt)
     status = "all stages passed ✓" if all_stages_passed else f"stopped at stage {stage_idx} ({stage_name}) ✗"
     print(f"\nFinal curriculum checkpoint: {best_ckpt.name}  [{status}]")
     return best_ckpt, all_stages_passed

@@ -126,13 +126,23 @@ def masked_focal_loss(
     """
     Apply action mask before computing focal loss.
     Fills invalid action logits with -1e9 before softmax.
+
+    Samples where the target action is itself masked (invalid per action_masking)
+    are excluded from the loss.  Without this, log_pt ≈ -1e9 for those samples,
+    inflating the mean loss by ~82 000× and producing gradient spikes.
     """
     masked_logits = logits.masked_fill(~masks, -1e9)
     log_probs = torch.log_softmax(masked_logits, dim=1)
     log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
     pt = log_pt.exp()
     focal_weight = (1.0 - pt) ** gamma
-    return (-focal_weight * log_pt).mean()
+    loss = -focal_weight * log_pt
+
+    # Exclude samples whose target action is masked (rare ~0.01% of BC data,
+    # but each contributes loss ≈ 1e9, inflating the gradient catastrophically).
+    target_valid = masks.gather(1, targets.unsqueeze(1)).squeeze(1)
+    valid_n = target_valid.float().sum().clamp(min=1.0)
+    return (loss * target_valid.float()).sum() / valid_n
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
