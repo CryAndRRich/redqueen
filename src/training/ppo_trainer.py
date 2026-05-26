@@ -464,7 +464,7 @@ def train_curriculum(
     _save_sb3_weights(model, best_ckpt)
     status = "all stages passed ✓" if all_stages_passed else f"stopped at stage {stage_idx} ({stage_name}) ✗"
     print(f"\nFinal curriculum checkpoint: {best_ckpt.name}  [{status}]")
-    return best_ckpt
+    return best_ckpt, all_stages_passed
 
 
 def train_self_play(
