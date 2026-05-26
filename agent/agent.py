@@ -6,8 +6,8 @@ so the file can be submitted with just model.onnx and requirements.txt.
 
 Required files in same directory (zip root):
     agent.py        ← this file
-    model.onnx      ← exported with src/utils/export_onnx.py
-    requirements.txt
+    model.onnx      ← primary ONNX inference
+    model.pt        ← TorchScript fallback (if onnxruntime unavailable)
 
 Public interface (competition standard):
     class Agent:

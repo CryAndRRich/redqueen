@@ -83,6 +83,9 @@ class SingleAgentBomberEnv(gym.Env):
         self._my_kills: int = 0
         self._my_boxes: int = 0
         self._episode_seed: int = seed or 0
+        # Position history for multi-step stagnation detection.
+        # Catches oscillation (A↔B) that single-step standing_still misses.
+        self._pos_history: list[tuple[int, int]] = []
 
         # Build ordered list of [controlled_id, opp0_id, opp1_id, opp2_id]
         all_ids = list(range(4))
@@ -111,10 +114,15 @@ class SingleAgentBomberEnv(gym.Env):
         self._initial_boxes = count_boxes(raw["map"])
         self._my_kills = 0
         self._my_boxes = 0
+        self._pos_history = []
 
-        # Re-init opponents to reset any internal state
+        # Re-init opponents to reset any internal state.
+        # Call reset() for wrappers that track per-episode state (e.g. PastAgentWrapper);
+        # fall back to clearing escape_mode for legacy rule agents that don't expose reset().
         for opp in self._opponents:
-            if hasattr(opp, "escape_mode"):
+            if hasattr(opp, "reset"):
+                opp.reset()
+            elif hasattr(opp, "escape_mode"):
                 opp.escape_mode = False
 
         return self._build_obs(), {}
@@ -144,6 +152,20 @@ class SingleAgentBomberEnv(gym.Env):
         self._my_boxes += max(0, prev_boxes - curr_boxes)
 
         reward = compute_reward(self._raw_obs, next_raw, self._aid)
+
+        # Multi-step stagnation penalty: catches camping / oscillation (A↔B).
+        # Fires when agent occupied the same cell 6+ times in last 8 steps.
+        # Complements reward_v2 standing_still (which only sees 1-step position change).
+        my_pos = (int(curr_p[self._aid][0]), int(curr_p[self._aid][1]))
+        self._pos_history.append(my_pos)
+        if len(self._pos_history) > 8:
+            self._pos_history.pop(0)
+        if len(self._pos_history) == 8 and int(curr_p[self._aid][2]) == 1:
+            freq: dict[tuple, int] = {}
+            for pos in self._pos_history:
+                freq[pos] = freq.get(pos, 0) + 1
+            if max(freq.values()) >= 6:
+                reward -= 0.03  # ~4× standing_still rate; discourages camping/oscillation
 
         self._prev_obs = self._raw_obs
         self._raw_obs = next_raw

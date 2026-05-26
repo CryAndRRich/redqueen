@@ -64,8 +64,7 @@ PPO_DEFAULTS: dict = {
     "gamma":           0.995,
     "gae_lambda":      0.95,
     "clip_range":      0.2,
-    "ent_coef":        0.03,   # raised from 0.02: BC pretraining makes policy deterministic;
-                               # 0.02 causes entropy collapse within Stage 1 (entropy_loss -1.16→-0.58)
+    "ent_coef":        0.03,   # overridden at runtime by STAGE_ENT_COEF[stage_idx]; this default is never used
     "vf_coef":         0.5,
     "max_grad_norm":   0.5,
 }
@@ -87,12 +86,11 @@ CURRICULUM_STAGES = [
     ("genius",          2.0),   # Stage 6: 2 Genius + 1 Tactical anchor
 ]
 
-# ent_coef per stage: start high (0.08) to undo BC determinism, anneal across stages.
-# BC pretraining drives policy toward near-deterministic distribution (low entropy).
-# ent_coef=0.03 was insufficient — entropy collapsed from -1.16→-0.30 within Stage 1.
-# Ref: Costa 2021 "32 Details of PPO" — entropy bonus is primary anti-collapse mechanism.
-# Ref: Meishner et al. 2019 (arXiv:1911.04947) — BC init requires elevated entropy pressure.
-STAGE_ENT_COEF = [0.08, 0.06, 0.06, 0.05, 0.05, 0.04, 0.03]
+# ent_coef per stage: high early (undo BC determinism), anneal across stages.
+# Stage 1 keeps 0.08 (same as Stage 0): observed collapse from -1.1→-0.35 nats
+# when Stage 0→1 transition dropped ent_coef from 0.08 to 0.06.
+# Ref: Costa 2021 "32 Details of PPO"; Meishner et al. 2019 (arXiv:1911.04947).
+STAGE_ENT_COEF = [0.08, 0.08, 0.07, 0.06, 0.06, 0.05, 0.04]
 
 # Minimum steps per stage regardless of win-rate threshold being met.
 # Reduced from 200k → 100k: observed Stage 1 peaked at 50-100k then deteriorated
@@ -203,16 +201,38 @@ def _make_self_play_env_fn(
 # ─────────────────────────────────────────────────────────────────────────── #
 
 def _load_bc_into_sb3(model, bc_path: Path, device: str) -> None:
-    """Transfer BC-trained weights into SB3 MaskablePPO policy."""
+    """Transfer ALL BC-trained weights into SB3 MaskablePPO policy.
+
+    Full layer mapping (BomberPolicyNet → SB3 MaskablePPO):
+      spatial_enc          → features_extractor.spatial_enc
+      aux_enc              → features_extractor.aux_enc
+      fusion[0] (3168→256) → features_extractor.fusion[0]
+      fusion[2] (256→128)  → mlp_extractor.policy_net[0]
+                           → mlp_extractor.value_net[0]  (shared in BC, split in SB3)
+      policy_head (128→6)  → action_net
+      value_head  (128→1)  → value_net
+
+    Previously only the feature extractor (spatial_enc, aux_enc, fusion[0]) was loaded.
+    The BC-trained policy_head and value_head were silently discarded, causing PPO to
+    start with a randomly-initialized action head despite BC pre-training.  This was
+    the root cause of entropy instability and slow Stage 0→1 convergence.
+    """
     import torch
     from src.models.policy_network import BomberPolicyNet
 
     bc_net = BomberPolicyNet.load(str(bc_path), device=device)
-    fe = model.policy.features_extractor
+    fe  = model.policy.features_extractor
+    pol = model.policy
+
     fe.spatial_enc.load_state_dict(bc_net.spatial_enc.state_dict())
     fe.aux_enc.load_state_dict(bc_net.aux_enc.state_dict())
-    fe.fusion.load_state_dict(bc_net.fusion[:2].state_dict())  # first Linear+ReLU
-    print(f"Loaded BC weights from {bc_path.name}")
+    fe.fusion.load_state_dict(bc_net.fusion[:2].state_dict())
+    # BC fusion[2] is shared actor+critic; initialize both SB3 branches from it.
+    pol.mlp_extractor.policy_net[0].load_state_dict(bc_net.fusion[2].state_dict())
+    pol.mlp_extractor.value_net[0].load_state_dict(bc_net.fusion[2].state_dict())
+    pol.action_net.load_state_dict(bc_net.policy_head.state_dict())
+    pol.value_net.load_state_dict(bc_net.value_head.state_dict())
+    print(f"  Loaded BC weights (all layers) from {bc_path.name}")
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -243,20 +263,66 @@ from src.logic.action_masking import compute_action_mask, apply_mask_to_logits
 
 
 class PastAgentWrapper:
-    """Rule-compatible .act(obs) interface backed by a BomberPolicyNet checkpoint."""
+    """Rule-compatible .act(obs) interface backed by a BomberPolicyNet checkpoint.
+
+    Tracks per-episode state (step, kills, boxes) so aux features 3-6 are
+    accurate during self-play — same as the main SingleAgentBomberEnv wrapper.
+    reset() is called by SingleAgentBomberEnv.reset() between episodes.
+    """
 
     def __init__(self, ckpt_path: str, agent_id: int) -> None:
         self.agent_id = int(agent_id)
         self._net = BomberPolicyNet.load(ckpt_path, device="cpu")
+        self._step: int = 0
+        self._initial_boxes: int = 50
+        self._my_kills: int = 0
+        self._my_boxes: int = 0
+        self._prev_players = None
+        self._prev_grid: "np.ndarray | None" = None
+
+    def reset(self) -> None:
+        self._step = 0
+        self._initial_boxes = 50
+        self._my_kills = 0
+        self._my_boxes = 0
+        self._prev_players = None
+        self._prev_grid = None
 
     def act(self, obs: dict) -> int:
-        spatial, aux = extract_features(obs, self.agent_id)
+        curr_players = np.asarray(obs["players"])
+        curr_grid    = np.asarray(obs["map"], dtype=np.int8)
+
+        # Update per-episode trackers (same logic as SingleAgentBomberEnv.step)
+        if self._prev_players is not None:
+            prev_en = sum(int(self._prev_players[i][2]) for i in range(4) if i != self.agent_id)
+            curr_en = sum(int(curr_players[i][2])       for i in range(4) if i != self.agent_id)
+            self._my_kills += max(0, prev_en - curr_en)
+        if self._prev_grid is not None:
+            self._my_boxes += int(((self._prev_grid == 2) & (curr_grid != 2)).sum())
+        if self._step == 0:
+            self._initial_boxes = max(1, int((curr_grid == 2).sum()))
+
+        boxes_now = int((curr_grid == 2).sum())
+
+        spatial, aux = extract_features(
+            obs, self.agent_id,
+            step=self._step,
+            initial_boxes=self._initial_boxes,
+            boxes_remaining=boxes_now,
+            my_kills=self._my_kills,
+            my_boxes_destroyed=self._my_boxes,
+        )
         mask = compute_action_mask(obs, self.agent_id)
         sp_t = torch.from_numpy(spatial).unsqueeze(0)
         ax_t = torch.from_numpy(aux).unsqueeze(0)
         with torch.no_grad():
             logits = self._net.get_action_logits(sp_t, ax_t).squeeze(0).numpy()
         masked = apply_mask_to_logits(logits, mask)
+
+        self._step += 1
+        self._prev_players = curr_players.copy()
+        self._prev_grid    = curr_grid.copy()
+
         return int(np.argmax(masked))
 '''
     )
@@ -271,10 +337,15 @@ class CurriculumAdvanceCallback:
     Checks average rank after every learn() call.
     Rank: 0=win (sole survivor), 1=2nd, 2=3rd, 3=died early — lower is better.
 
-    Advances stage when ALL of the following hold:
-      1. avg_rank <= threshold for `patience` consecutive windows
-      2. No worsening trend (rank delta > 0.15 over last 3 evals resets counter)
-      3. At least `min_steps` have been taken in this stage (consolidation guard)
+    Advances stage when:
+      1. Rolling mean of last 3 eval windows <= threshold
+      2. At least min_steps have been taken in this stage (consolidation guard)
+
+    Rolling mean replaced 3-consecutive: SE(avg_rank) ≈ 0.035 with 200 episodes,
+    so a single unlucky window can push an otherwise-passing model above threshold
+    indefinitely. Observed in training: Stage 1 reached 0.89 at 100k but then
+    oscillated [1.38, 1.30, 1.69, 1.20, ...] — never 3 consecutive below 1.2.
+    Rolling mean of first 3 windows = (1.12+0.89+1.38)/3 = 1.13 ≤ 1.2 → advance.
     """
 
     def __init__(
@@ -282,7 +353,7 @@ class CurriculumAdvanceCallback:
         eval_env_fn: Callable,
         n_eval_episodes: int = 200,   # raised from 100: 4-player FFA has high variance
         rank_threshold: float = 1.5,
-        patience: int = 3,
+        patience: int = 3,            # kept for API compat; not used (rolling mean)
         min_steps: int = MIN_STEPS_PER_STAGE,
     ) -> None:
         self.eval_env_fn = eval_env_fn
@@ -290,7 +361,6 @@ class CurriculumAdvanceCallback:
         self.threshold = rank_threshold
         self.patience = patience
         self.min_steps = min_steps
-        self._consecutive = 0
         self._history: list[float] = []
         self._steps_in_stage: int = 0
         self.stage_passed: bool = False
@@ -298,73 +368,78 @@ class CurriculumAdvanceCallback:
     def evaluate(self, model) -> float:
         """Run n_eval_episodes, return average rank (lower is better).
 
-        Rank scale: 0=win (sole survivor or tie-break winner), 3=died early.
+        Rank scale: 0=win (sole survivor), 3=died early.
 
         Draw handling (step-500 truncation with multiple survivors):
-          Old formula  rank = n_alive - 1  gave rank=3 when 4 agents survived,
-          equating "alive at game end" with "died early". This corrupt signal
-          caused the policy to deteriorate during Stage 1 training.
-          Fix: alive-in-draw → expected rank = (n_alive - 1) // 2.
-            n_alive=2 → rank 0  (50 % chance of winning tie-break; give benefit of doubt)
-            n_alive=3 → rank 1
-            n_alive=4 → rank 1  (vs old: rank 3)
+          BTC rule (2026-05-26): surviving agents ranked by Kills > Boxes > Items > Bombs.
+          We have our agent's kills from info["kills"]. Opponents' stats are unavailable,
+          so we use a kills-aware estimate:
+            - kills > 0: rank = 0.0  (kills dominate; rule-based opponents rarely score kills)
+            - kills == 0: rank = (n_alive - 1) / 2.0  (conservative uniform estimate)
+          This is still approximate — at genius stage, opponents can also score kills.
+          The reward function (kills +2.0, boxes +0.4, items +0.3, bombs +0.003) already
+          incentivises tie-break stats throughout training.
+
+          Old integer formula (n_alive-1)//2 gave rank=0 for n_alive=2 draws, treating
+          "survived with one enemy alive" the same as "won outright" — fixed to float.
         """
         env = self.eval_env_fn()
-        total_rank = 0
+        total_rank = 0.0
         for ep in range(self.n_eval_episodes):
             obs, _ = env.reset(seed=ep)
             done = False
+            final_info: dict = {}
             while not done:
                 mask = env.action_masks()
                 action, _ = model.predict(obs, action_masks=mask, deterministic=True)
-                obs, _, terminated, truncated, _ = env.step(int(action))
+                obs, _, terminated, truncated, final_info = env.step(int(action))
                 done = terminated or truncated
             raw = env.raw_obs
             if raw is not None:
                 alive = [int(raw["players"][i][2]) for i in range(4)]
                 n_alive = sum(alive)
                 if not alive[0]:
-                    rank = 3  # we died
+                    rank = 3.0   # we died
                 elif n_alive == 1:
-                    rank = 0  # sole survivor — unambiguous win
+                    rank = 0.0   # sole survivor — unambiguous win
                 else:
-                    # Step-500 draw: multiple agents survived.
-                    # Expected rank = (n_alive-1)//2 (uniform tie-break assumption).
-                    # For n_alive=4: rank=1 (was 3 — the key fix).
-                    rank = (n_alive - 1) // 2
+                    # Step-500 draw: use kills to refine rank estimate (BTC tie-break rule).
+                    agent_kills = final_info.get("kills", 0)
+                    if agent_kills > 0:
+                        rank = 0.0  # kills dominate rule-based opponents
+                    else:
+                        rank = (n_alive - 1) / 2.0  # conservative uniform estimate
             else:
-                rank = 3
+                rank = 3.0
             total_rank += rank
         env.close()
         return total_rank / self.n_eval_episodes
 
     def check(self, model, steps_this_iter: int = 50_000) -> bool:
-        """Return True if curriculum should advance."""
+        """Return True if curriculum should advance.
+
+        Rolling-mean advancement: average of last 3 eval windows ≤ threshold.
+        Requires at least min_steps in this stage (consolidation guard).
+        """
         self._steps_in_stage += steps_this_iter
         avg_rank = self.evaluate(model)
         self._history.append(avg_rank)
         print(f"  Avg rank: {avg_rank:.2f} (threshold ≤ {self.threshold:.1f})")
-
-        if avg_rank <= self.threshold:
-            self._consecutive += 1
-        else:
-            self._consecutive = 0
-
-        # Trend guard: worsening by >0.15 over the last 3 evals resets counter.
-        # Prevents advancing while the policy is deteriorating.
-        if len(self._history) >= 3:
-            trend = self._history[-1] - self._history[-3]
-            if trend > 0.15 and self._consecutive > 0:
-                print(f"  ↓ Worsening trend ({trend:+.2f} over 3 evals) — resetting consecutive count")
-                self._consecutive = 0
 
         # Consolidation guard: enforce minimum steps before advancing
         if self._steps_in_stage < self.min_steps:
             print(f"  ⏳ Min steps not reached ({self._steps_in_stage:,}/{self.min_steps:,}), holding")
             return False
 
-        self.stage_passed = self._consecutive >= self.patience
-        return self.stage_passed
+        # Rolling-mean over last 3 windows
+        if len(self._history) >= 3:
+            rolling = sum(self._history[-3:]) / 3
+            print(f"  Rolling mean (last 3): {rolling:.3f}")
+            if rolling <= self.threshold:
+                self.stage_passed = True
+                return True
+
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -491,6 +566,14 @@ def train_curriculum(
         # which is always ≥ as good as the final model (avoids keeping a deteriorated snapshot).
         if stage_best_ckpt.exists():
             shutil.copy2(stage_best_ckpt, best_ckpt)
+            # CRITICAL: Reload the stage-best weights back into the live model so
+            # the next stage starts from the peak model, not the current (possibly
+            # deteriorated) state.  Without this, Stage N+1 inherits the model at
+            # the advancement moment, which is often worse than the peak.
+            # E.g. Stage 1: peak 0.89 (100k), advancement at 150k (rank 1.38) →
+            # Stage 2 must start from 0.89, not 1.38.
+            if cb.stage_passed:  # only restore when advancing, not on failure
+                _restore_sb3_weights(model, stage_best_ckpt, device)
 
         # If stage not passed: stop — no point training harder stages on a failing policy.
         if not cb.stage_passed:
@@ -610,6 +693,43 @@ def _save_sb3_weights(model, path: Path) -> None:
         print(f"  Warning: partial weight transfer ({e})")
 
     torch.save({"model_state_dict": net.state_dict()}, path)
+
+
+def _restore_sb3_weights(model, checkpoint_path: Path, device: str) -> None:
+    """Load a BomberPolicyNet checkpoint back into a live SB3 MaskablePPO model.
+
+    This is the exact inverse of _save_sb3_weights.  Called after each curriculum
+    stage to reload the stage-best checkpoint into the model before the next stage
+    begins.  Without this, Stage N+1 starts from the final (often deteriorated)
+    model rather than the peak model.
+
+    Example: Stage 1 peaked at avg_rank 0.89 (step 100k) but was at avg_rank 1.38
+    at advancement (step 150k via rolling mean).  Loading the 0.89 checkpoint into
+    model ensures Stage 2 starts from the better policy.
+    """
+    import torch
+    from src.models.policy_network import BomberPolicyNet
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    net = BomberPolicyNet()
+    net.load_state_dict(ckpt["model_state_dict"])
+    net.to(device)
+
+    fe  = model.policy.features_extractor
+    pol = model.policy
+
+    try:
+        fe.spatial_enc.load_state_dict(net.spatial_enc.state_dict())
+        fe.aux_enc.load_state_dict(net.aux_enc.state_dict())
+        fe.fusion[0].load_state_dict(net.fusion[0].state_dict())
+        # fusion[2] was saved from policy_net[0]; reinitialize both branches.
+        pol.mlp_extractor.policy_net[0].load_state_dict(net.fusion[2].state_dict())
+        pol.mlp_extractor.value_net[0].load_state_dict(net.fusion[2].state_dict())
+        pol.action_net.load_state_dict(net.policy_head.state_dict())
+        pol.value_net.load_state_dict(net.value_head.state_dict())
+        print(f"  Restored stage-best weights from {checkpoint_path.name}")
+    except Exception as e:
+        print(f"  Warning: partial weight restore ({e})")
 
 
 # ─────────────────────────────────────────────────────────────────────────── #

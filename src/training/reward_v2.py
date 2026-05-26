@@ -260,9 +260,11 @@ def compute_reward(
                     break  # one bonus per step
 
     # ── Movement / standing still ─────────────────────────────────────── #
-    px, py = int(prev_p[aid][0]), int(prev_p[aid][1])
-    cx, cy = int(curr_p[aid][0]), int(curr_p[aid][1])
-    if px == cx and py == cy:
+    # px, py, cx, cy already defined above (item contest section).
+    # Skip when agent placed a bomb: PLACE_BOMB keeps position but is intentional.
+    # Bug: previously gave PLACE_BOMB net reward = +0.003 - 0.008 = -0.005,
+    # subtly discouraging the core game mechanic.
+    if px == cx and py == cy and not (prev_cap > curr_cap):
         reward += REWARDS["standing_still"]
 
     # ── Danger evasion / entry ────────────────────────────────────────── #
