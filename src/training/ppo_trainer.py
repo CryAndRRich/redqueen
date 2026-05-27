@@ -87,10 +87,21 @@ CURRICULUM_STAGES = [
 ]
 
 # ent_coef per stage: high early (undo BC determinism), anneal across stages.
-# Stage 1 keeps 0.08 (same as Stage 0): observed collapse from -1.1→-0.35 nats
-# when Stage 0→1 transition dropped ent_coef from 0.08 to 0.06.
+# Stage 1 raised to 0.10 (from 0.08): observed entropy collapse at Stage 1 start
+# even with 0.08 — entropy dropped from -0.77 (Stage 0) to -0.41 by iteration 3.
+# Root cause: Random→Simple distribution shift generates sparse/negative advantages,
+# pulling policy toward determinism.  0.10 provides extra entropy insurance for
+# the hardest transition.  Stage 2+ back to 0.08 and below.
 # Ref: Costa 2021 "32 Details of PPO"; Meishner et al. 2019 (arXiv:1911.04947).
-STAGE_ENT_COEF = [0.08, 0.08, 0.07, 0.06, 0.06, 0.05, 0.04]
+STAGE_ENT_COEF = [0.08, 0.10, 0.08, 0.07, 0.06, 0.05, 0.04]
+
+# Learning rate per stage: high LR at Stage 0 (far from optimum, BC init).
+# Decays at each stage: policy is already near a good solution; lower LR prevents
+# distribution-shift from Stage N opponents from causing large destabilizing updates.
+# Stage 1: 1.5e-4 (half of Stage 0) — most important reduction; Random→Simple is
+# the biggest distribution shift.  Optimizer state is CLEARED at each stage start
+# so accumulated Adam momentum from previous stage does not interfere.
+STAGE_LR = [3e-4, 1.5e-4, 1.2e-4, 1e-4, 8e-5, 8e-5, 5e-5]
 
 # Minimum steps per stage regardless of win-rate threshold being met.
 # Reduced from 200k → 100k: observed Stage 1 peaked at 50-100k then deteriorated
@@ -194,6 +205,28 @@ def _make_self_play_env_fn(
         env = SingleAgentBomberEnv(opponents=opps, agent_id=agent_id, seed=seed)
         return env
     return _factory
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Learning-rate / optimizer helpers                                             #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def _set_lr(model, lr: float) -> None:
+    """Apply a new LR immediately and clear Adam momentum for a clean stage start.
+
+    SB3 updates optimizer LR lazily (via _update_learning_rate called each rollout).
+    Directly patching param_groups ensures the very first training iteration of a
+    new stage uses the intended LR, not the previous stage's residual.
+
+    Clearing optimizer.state removes accumulated Adam m1/m2 estimates from the
+    previous stage's opponent distribution.  Fresh momentum prevents stale gradients
+    from the Stage-N (e.g. Random-agent) distribution from disrupting Stage-N+1.
+    """
+    model.learning_rate = lr
+    for group in model.policy.optimizer.param_groups:
+        group["lr"] = lr
+    model.policy.optimizer.state.clear()
+    print(f"  Optimizer lr={lr:.1e}, Adam state cleared")
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -506,16 +539,19 @@ def train_curriculum(
             )
             if init_from and init_from.exists():
                 _load_bc_into_sb3(model, init_from, device)
-            # Apply stage-specific ent_coef from Stage 0 — PPO_DEFAULTS ent_coef is
-            # too low to counteract BC-pretraining determinism (observed entropy collapse).
             model.ent_coef = STAGE_ENT_COEF[stage_idx]
-            print(f"  ent_coef set to {STAGE_ENT_COEF[stage_idx]} for stage {stage_idx}")
+            # Stage 0 already uses STAGE_LR[0]=3e-4 (same as PPO_DEFAULTS); _set_lr
+            # still clears stale optimizer state for consistency.
+            _set_lr(model, STAGE_LR[stage_idx])
+            print(f"  ent_coef={STAGE_ENT_COEF[stage_idx]}, lr={STAGE_LR[stage_idx]:.1e} for stage {stage_idx}")
         else:
             model.set_env(vec_env)
-            # Re-inject exploration entropy when entering a harder stage.
-            ent_coef = STAGE_ENT_COEF[stage_idx]
-            model.ent_coef = ent_coef
-            print(f"  ent_coef reset to {ent_coef} for stage {stage_idx}")
+            model.ent_coef = STAGE_ENT_COEF[stage_idx]
+            # Lower LR prevents distribution-shift from previous stage from causing
+            # large destabilizing updates.  _set_lr also clears Adam momentum so
+            # gradients accumulated against Stage-N opponents do not contaminate Stage-N+1.
+            _set_lr(model, STAGE_LR[stage_idx])
+            print(f"  ent_coef={STAGE_ENT_COEF[stage_idx]}, lr={STAGE_LR[stage_idx]:.1e} (reset) for stage {stage_idx}")
 
         eval_fn = _make_env_fn(stage_name, seed=9999, mix_random=False)
         cb = CurriculumAdvanceCallback(
@@ -562,18 +598,23 @@ def train_curriculum(
         vec_env.close()
 
         # Copy stage best into the overall best checkpoint.
-        # stage_best_ckpt holds the model with the lowest avg_rank seen this stage,
-        # which is always ≥ as good as the final model (avoids keeping a deteriorated snapshot).
         if stage_best_ckpt.exists():
             shutil.copy2(stage_best_ckpt, best_ckpt)
-            # CRITICAL: Reload the stage-best weights back into the live model so
-            # the next stage starts from the peak model, not the current (possibly
-            # deteriorated) state.  Without this, Stage N+1 inherits the model at
-            # the advancement moment, which is often worse than the peak.
-            # E.g. Stage 1: peak 0.89 (100k), advancement at 150k (rank 1.38) →
-            # Stage 2 must start from 0.89, not 1.38.
-            if cb.stage_passed:  # only restore when advancing, not on failure
-                _restore_sb3_weights(model, stage_best_ckpt, device)
+            if cb.stage_passed:
+                # Stage 0 → Stage 1: reload BC instead of Stage 0 best.
+                # Rationale: 150k steps against Random agents specialises the policy
+                # for Random-opponent patterns (quick deaths, no strategic bombing).
+                # This weakens the general BC skills needed against Simple agents.
+                # Re-anchoring to BC gives Stage 1 GeniusRuleAgent's full strategic
+                # knowledge as a foundation — a better starting point than Stage 0 best.
+                if stage_idx == 0 and init_from is not None and init_from.exists():
+                    _load_bc_into_sb3(model, init_from, device)
+                    print("  Re-anchored to BC weights for Stage 1 (better Stage 1 init than Stage 0 best)")
+                else:
+                    # Stage N>0 → Stage N+1: reload stage-best (peak model, not final).
+                    # E.g. Stage 1 peaked at 1.09 (100k) but advanced at 1.38 (150k);
+                    # Stage 2 should start from 1.09, not 1.38.
+                    _restore_sb3_weights(model, stage_best_ckpt, device)
 
         # If stage not passed: stop — no point training harder stages on a failing policy.
         if not cb.stage_passed:

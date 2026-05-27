@@ -27,8 +27,10 @@ KEY INVARIANTS:
   - agent.py must be at ZIP ROOT (not in a subfolder)
   - Never import PyTorch in agent.py — ONNX Runtime only
   - Bomb pad to (MAX_BOMBS=16, 4) before ONNX export
-  - STAGE_ENT_COEF = [0.08, 0.08, 0.07, 0.06, 0.06, 0.05, 0.04]
+  - STAGE_ENT_COEF = [0.08, 0.10, 0.08, 0.07, 0.06, 0.05, 0.04]  ← Stage 1=0.10
+  - STAGE_LR       = [3e-4, 1.5e-4, 1.2e-4, 1e-4, 8e-5, 8e-5, 5e-5]
   - MIN_STEPS_PER_STAGE = 100_000
+  - Stage 0→1 transition: reload BC (not Stage 0 best) + clear optimizer state
 ```
 
 ---
@@ -415,8 +417,15 @@ Phase 3  PPO + 7-Stage Curriculum   RL fine-tune from BC init
   └─ Action Masking: ACTIVE, hard-coded
   └─ Reward: v3 (tie-break aware, correct box attribution)
   └─ SubprocVecEnv: 4–8 parallel environments
-  └─ ent_coef schedule: 0.08 → 0.08 → 0.07 → 0.06 → 0.06 → 0.05 → 0.04
-     (Stages 0-1 = 0.08: ent_coef 0.06 caused entropy collapse to -0.35 nats at Stage 1)
+  └─ ent_coef schedule: 0.08 → 0.10 → 0.08 → 0.07 → 0.06 → 0.05 → 0.04
+     (Stage 1 = 0.10: hardest distribution shift Random→Simple; 0.08 caused entropy
+      collapse -0.77→-0.41 within 3 iterations of Stage 1 start)
+  └─ LR schedule (STAGE_LR): 3e-4 → 1.5e-4 → 1.2e-4 → 1e-4 → 8e-5 → 8e-5 → 5e-5
+     (Lower LR at each stage: policy already near good solution, prevent drift;
+      optimizer state cleared at stage start to remove Stage-N Adam momentum)
+  └─ Stage 0→1 special: reload BC (not Stage 0 best) as Stage 1 init.
+     Stage 0 specializes for Random opponents (weakens danger-avoidance vs strategic agents).
+     BC has full GeniusRuleAgent knowledge → better Stage 1 foundation.
      (Advancement: rolling mean of last 3 eval windows ≤ threshold, min 100k steps)
   └─ 20% random opponent mixing per training env (prevents co-adaptation)
   └─ Curriculum stages (MIN_STEPS_PER_STAGE=100_000 each, eval every 50k over 200 games):
@@ -459,11 +468,17 @@ PPO_DEFAULTS = {
     "max_grad_norm":   0.5,
 }
 
-# Per-stage ent_coef (applied at stage start, overrides PPO_DEFAULTS):
-STAGE_ENT_COEF = [0.08, 0.08, 0.07, 0.06, 0.06, 0.05, 0.04]
-# Stages 0-1 = 0.08: high entropy required to undo BC-pretraining determinism.
-# Previous value 0.03 caused entropy collapse (entropy_loss -1.16 → -0.30 in Stage 1).
+# Per-stage ent_coef (applied at stage start):
+STAGE_ENT_COEF = [0.08, 0.10, 0.08, 0.07, 0.06, 0.05, 0.04]
+# Stage 1 = 0.10: Random→Simple is hardest distribution shift. 0.08 caused entropy
+# collapse from -0.77 (Stage 0) to -0.41 within 3 iterations of Stage 1.
 # Source: Costa 2021 "32 Details of PPO"; Meishner et al. 2019 (arXiv:1911.04947).
+
+# Per-stage learning rate (optimizer state cleared at each stage transition):
+STAGE_LR = [3e-4, 1.5e-4, 1.2e-4, 1e-4, 8e-5, 8e-5, 5e-5]
+# Lower LR at each stage prevents distribution shift from destabilizing policy.
+# Adam momentum cleared each transition — stale Stage-N gradients must not
+# contaminate Stage-N+1 updates.
 ```
 
 ### Pipeline Summary Table
@@ -631,6 +646,15 @@ No. League Training is the mechanism for combining knowledge across model versio
 - BC weight transfer fix: action head was being discarded during BC→PPO init (now correctly transferred)
 - BTC tie-break clarification (2026-05-26): survivors at step 500 are ranked among themselves, not all equal. `evaluate()` updated: `rank=0` if `kills>0`, else `rank=(n_alive-1)/2.0`
 - Notebook Cell 6 corrected: 100k min steps, rolling mean advancement, correct ent_coef schedule
+
+### 2026-05-27 — Stage 1 convergence fix (3 root causes from Kaggle log)
+- **Root cause 1**: LR=3e-4 too high at Stage 0→1 transition → entropy collapse -0.77→-0.41 in 3 iters
+- **Root cause 2**: Stage 0 best weights specialized for Random agents → weak danger-avoidance vs Simple
+- **Root cause 3**: Stale Adam momentum from Stage 0 contaminates Stage 1 gradients
+- **Fix 1**: Added `STAGE_LR = [3e-4, 1.5e-4, 1.2e-4, 1e-4, 8e-5, 8e-5, 5e-5]` + `_set_lr()` helper
+- **Fix 2**: `STAGE_ENT_COEF[1]` raised 0.08 → 0.10 (extra entropy insurance for hardest transition)
+- **Fix 3**: Stage 0→1: reload BC weights (not Stage 0 best) + clear optimizer state each stage start
+- Best Stage 1 result before fixes: avg_rank 1.30 at 650k, rolling mean never below 1.487 (threshold 1.2)
 
 ---
 
