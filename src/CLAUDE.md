@@ -12,10 +12,8 @@
 | `logic/action_masking.py` | BFS-based safety filter — eliminates suicidal/invalid actions |
 | `logic/pathfinding.py` | BFS/A* navigation helpers |
 | `models/policy_network.py` | BomberPolicyNet (actor-critic) + BomberCNNExtractor for SB3 |
-| `training/reward_v2.py` | Reward function (v3 logic despite filename) |
+| `training/reward.py` | Reward function (v3 logic) |
 | `training/ppo_trainer.py` | Phase 3-4 MaskablePPO — 7-stage curriculum + self-play |
-| `training/bc_trainer.py` | Phase 2 behavioral cloning (focal loss, γ=2) |
-| `training/history_parser.py` | Phase 0 history mining from history_game/ |
 | `utils/feature_extractor.py` | obs dict → (spatial 15×13×13, aux 7) float32 |
 | `utils/export_onnx.py` | BomberPolicyNet → model.onnx + model.pt |
 | `wrappers/bomberland_env.py` | Gymnasium single-agent wrapper for MaskablePPO |

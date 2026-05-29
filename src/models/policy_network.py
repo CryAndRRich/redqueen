@@ -182,7 +182,7 @@ class BomberPolicyNet(nn.Module):
         self.fusion[0].load_state_dict(fe.fusion[0].state_dict())
 
     def init_from_bc(self, bc_path: str, device: str = "cpu") -> None:
-        """Load weights saved by bc_trainer.py."""
+        """Load BC weights from a tactical_bc.py checkpoint."""
         ckpt = torch.load(bc_path, map_location=device)
         state = ckpt.get("model_state_dict", ckpt)
         self.load_state_dict(state, strict=False)

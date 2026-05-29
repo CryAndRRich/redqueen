@@ -214,15 +214,18 @@ def _make_self_play_env_fn(
 def _set_lr(model, lr: float) -> None:
     """Apply a new LR immediately and clear Adam momentum for a clean stage start.
 
-    SB3 updates optimizer LR lazily (via _update_learning_rate called each rollout).
-    Directly patching param_groups ensures the very first training iteration of a
-    new stage uses the intended LR, not the previous stage's residual.
+    SB3 calls _update_learning_rate() at every rollout, which reads model.lr_schedule
+    (not model.learning_rate) to set the optimizer LR.  lr_schedule is created once
+    during __init__() from the initial learning_rate and never updated automatically.
+    Setting only model.learning_rate has no effect — the old schedule overwrites it
+    next rollout.  We must also patch lr_schedule to make the change stick.
 
     Clearing optimizer.state removes accumulated Adam m1/m2 estimates from the
     previous stage's opponent distribution.  Fresh momentum prevents stale gradients
     from the Stage-N (e.g. Random-agent) distribution from disrupting Stage-N+1.
     """
     model.learning_rate = lr
+    model.lr_schedule = lambda _: lr   # SB3 reads this every rollout — must patch it
     for group in model.policy.optimizer.param_groups:
         group["lr"] = lr
     model.policy.optimizer.state.clear()
@@ -481,13 +484,28 @@ class CurriculumAdvanceCallback:
 
 def train_curriculum(
     output_dir: Path,
-    total_steps_per_stage: int = 500_000,
+    total_steps_per_stage: int = 750_000,
     n_envs: int = 8,
     init_from: Path | None = None,
+    init_from_tactical: Path | None = None,
     device: str = "auto",
+    log_dir: Path | None = None,
+    eval_freq: int = 50_000,
+    eval_episodes: int = 200,
+    min_steps_per_stage: int = MIN_STEPS_PER_STAGE,
 ) -> tuple[Path, bool]:
     """
     Phase 3: curriculum PPO training.
+
+    Args:
+        init_from:            BC checkpoint — used for Stage 0 init AND Stage 0→1 reload
+                              (if init_from_tactical is not provided).
+        init_from_tactical:   Tactical checkpoint — if provided, used at Stage 0→1 reload
+                              instead of init_from.  Supplies stronger strategic knowledge
+                              than BC while avoiding Stage 0 Random-agent specialisation.
+        eval_freq:            Evaluate every N steps within a stage (default: 50,000).
+        eval_episodes:        Episodes per evaluation window (default: 200).
+        min_steps_per_stage:  Minimum steps before a stage can advance (default: MIN_STEPS_PER_STAGE).
 
     Returns:
         (best_ckpt, all_stages_passed) — if a stage fails to meet threshold within
@@ -510,6 +528,7 @@ def train_curriculum(
     from src.models.policy_network import BomberCNNExtractor, make_observation_space
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    tb_log_dir = str(log_dir) if log_dir is not None else str(output_dir / "tb_logs")
     best_ckpt = output_dir / "ppo_curriculum_best.pt"
 
     model = None
@@ -534,7 +553,7 @@ def train_curriculum(
                 },
                 verbose=1,
                 device=device,
-                tensorboard_log=str(output_dir / "tb_logs"),
+                tensorboard_log=tb_log_dir,
                 **PPO_DEFAULTS,
             )
             if init_from and init_from.exists():
@@ -556,10 +575,10 @@ def train_curriculum(
         eval_fn = _make_env_fn(stage_name, seed=9999, mix_random=False)
         cb = CurriculumAdvanceCallback(
             eval_fn,
+            n_eval_episodes=eval_episodes,
             rank_threshold=wr_thresh,
             patience=3,
-            min_steps=MIN_STEPS_PER_STAGE,
-            # n_eval_episodes uses default (200)
+            min_steps=min_steps_per_stage,
         )
 
         # Track the best checkpoint WITHIN this stage.
@@ -571,18 +590,18 @@ def train_curriculum(
         steps_done = 0
         while steps_done < total_steps_per_stage:
             model.learn(
-                total_timesteps=50_000,
+                total_timesteps=eval_freq,
                 reset_num_timesteps=False,
                 tb_log_name=f"stage_{stage_idx}_{stage_name}",
             )
-            steps_done += 50_000
+            steps_done += eval_freq
 
             ts = time.strftime("%Y%m%d_%H%M%S")
             ckpt = output_dir / f"ppo_s{stage_idx}_{steps_done}steps_{ts}.pt"
             _save_sb3_weights(model, ckpt)
             print(f"  Saved {ckpt.name}")
 
-            advanced = cb.check(model, steps_this_iter=50_000)
+            advanced = cb.check(model, steps_this_iter=eval_freq)
 
             # Save stage-best checkpoint when a new best avg_rank is achieved.
             last_rank = cb._history[-1]
@@ -607,9 +626,18 @@ def train_curriculum(
                 # This weakens the general BC skills needed against Simple agents.
                 # Re-anchoring to BC gives Stage 1 GeniusRuleAgent's full strategic
                 # knowledge as a foundation — a better starting point than Stage 0 best.
-                if stage_idx == 0 and init_from is not None and init_from.exists():
-                    _load_bc_into_sb3(model, init_from, device)
-                    print("  Re-anchored to BC weights for Stage 1 (better Stage 1 init than Stage 0 best)")
+                if stage_idx == 0:
+                    # Prefer tactical checkpoint over BC for Stage 1 re-anchor.
+                    # Tactical weights are stronger than BC and avoid Random-agent
+                    # specialisation, making them the best Stage 1 foundation when available.
+                    _anchor_ckpt = (
+                        init_from_tactical if (init_from_tactical and init_from_tactical.exists())
+                        else init_from if (init_from and init_from.exists())
+                        else None
+                    )
+                    if _anchor_ckpt is not None:
+                        _load_bc_into_sb3(model, _anchor_ckpt, device)
+                        print(f"  Re-anchored to {_anchor_ckpt.name} for Stage 1 (better Stage 1 init than Stage 0 best)")
                 else:
                     # Stage N>0 → Stage N+1: reload stage-best (peak model, not final).
                     # E.g. Stage 1 peaked at 1.09 (100k) but advanced at 1.38 (150k);
@@ -635,11 +663,12 @@ def train_curriculum(
 def train_self_play(
     output_dir: Path,
     snapshot_dir: Path,
-    total_steps: int = 1_000_000,
+    total_steps: int = 500_000,
     n_envs: int = 8,
     snapshot_every: int = 50_000,
     init_from: Path | None = None,
     device: str = "auto",
+    log_dir: Path | None = None,
 ) -> Path:
     """Phase 4: continuous self-play PPO training."""
     import warnings
@@ -657,6 +686,7 @@ def train_self_play(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
+    tb_log_dir = str(log_dir) if log_dir is not None else str(output_dir / "tb_logs")
 
     env_fns = [_make_self_play_env_fn(snapshot_dir, seed=i) for i in range(n_envs)]
     vec_env = SubprocVecEnv(env_fns)
@@ -671,7 +701,7 @@ def train_self_play(
         },
         verbose=1,
         device=device,
-        tensorboard_log=str(output_dir / "tb_logs"),
+        tensorboard_log=tb_log_dir,
         **PPO_DEFAULTS,
     )
 
@@ -782,21 +812,48 @@ def _cli() -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--curriculum",  action="store_true")
     group.add_argument("--self-play",   action="store_true")
-    parser.add_argument("--output-dir",    type=Path, default=_ROOT / "checkpoints")
-    parser.add_argument("--snapshot-dir",  type=Path, default=_ROOT / "checkpoints" / "past_agents")
-    parser.add_argument("--init-from",     type=Path, default=None)
-    parser.add_argument("--total-steps",   type=int,  default=500_000)
-    parser.add_argument("--n-envs",        type=int,  default=8)
-    parser.add_argument("--device",        type=str,  default="auto")
+    parser.add_argument("--output-dir",              type=Path, default=_ROOT / "checkpoints")
+    parser.add_argument("--log-dir",                 type=Path, default=_ROOT / "logs",
+                        help="TensorBoard log directory (default: <repo>/logs).")
+    parser.add_argument("--snapshot-dir",            type=Path, default=_ROOT / "checkpoints" / "past_agents")
+    parser.add_argument("--init-from",               type=Path, default=None,
+                        help="BC checkpoint used for Stage 0 init and Stage 0→1 re-anchor fallback.")
+    parser.add_argument("--init-from-tactical",      type=Path, default=None,
+                        help="Tactical checkpoint used at Stage 0→1 re-anchor (preferred over --init-from).")
+    # --total-steps-per-stage (curriculum) / --total-steps (self-play and legacy alias)
+    parser.add_argument("--total-steps-per-stage",   type=int,  default=None,
+                        help="Max timesteps per curriculum stage (default: 750,000).")
+    parser.add_argument("--total-steps",             type=int,  default=500_000,
+                        help="Total timesteps for self-play (default: 500,000).")
+    parser.add_argument("--n-envs",                  type=int,  default=8)
+    parser.add_argument("--eval-freq",               type=int,  default=50_000,
+                        help="Evaluate every N steps within a stage (default: 50,000).")
+    parser.add_argument("--eval-episodes",           type=int,  default=200,
+                        help="Episodes per evaluation window (default: 200).")
+    parser.add_argument("--min-steps-per-stage",     type=int,  default=MIN_STEPS_PER_STAGE,
+                        help=f"Minimum steps before a stage can advance (default: {MIN_STEPS_PER_STAGE:,}).")
+    parser.add_argument("--snapshot-every",          type=int,  default=50_000,
+                        help="Snapshot interval for self-play in steps (default: 50,000).")
+    parser.add_argument("--pool-size",               type=int,  default=20,
+                        help="Maximum past-agent pool size for self-play (default: 20).")
+    parser.add_argument("--device",                  type=str,  default="auto")
     args = parser.parse_args()
+
+    # --total-steps-per-stage takes precedence over --total-steps for curriculum.
+    steps_per_stage = args.total_steps_per_stage if args.total_steps_per_stage is not None else 750_000
 
     if args.curriculum:
         train_curriculum(
             output_dir=args.output_dir,
-            total_steps_per_stage=args.total_steps,
+            total_steps_per_stage=steps_per_stage,
             n_envs=args.n_envs,
             init_from=args.init_from,
+            init_from_tactical=args.init_from_tactical,
             device=args.device,
+            log_dir=args.log_dir if args.log_dir != _ROOT / "logs" else None,
+            eval_freq=args.eval_freq,
+            eval_episodes=args.eval_episodes,
+            min_steps_per_stage=args.min_steps_per_stage,
         )
     else:
         train_self_play(
@@ -804,8 +861,10 @@ def _cli() -> None:
             snapshot_dir=args.snapshot_dir,
             total_steps=args.total_steps,
             n_envs=args.n_envs,
+            snapshot_every=args.snapshot_every,
             init_from=args.init_from,
             device=args.device,
+            log_dir=args.log_dir if args.log_dir != _ROOT / "logs" else None,
         )
 
 

@@ -12,7 +12,7 @@ MAP CODES    0=Grass  1=Wall  2=Box  3=ItemRadius  4=ItemCapacity
 OBS SCHEMA   {"map": (13,13) int8, "players": (4,5) int8, "bombs": (N,4) int8}
 PROTECTED    src/logic/action_masking.py  ← NEVER edit without explicit instruction
 
-REWARD FILE  src/training/reward_v2.py     (contains v3 logic)
+REWARD FILE  src/training/reward.py   (v4 logic, no versioned suffix)
 NOTEBOOK     notebooks/train_on_kaggle.ipynb
 CHECKPOINT   {phase}_{description}_{timestamp}.pt  ← never overwrite
 
@@ -22,6 +22,8 @@ COMMON COMMANDS:
   create zip      cd agent && zip -j ../submission.zip agent.py ../exports/model.onnx ../checkpoints/<ckpt>.pt
   validate zip    unzip -l submission.zip | grep agent.py   # must show agent.py NOT */agent.py
   tensorboard     tensorboard --logdir logs/
+  tactical bc    python -m src.training.tactical_bc --generate --n-games 200
+  tactical train python -m src.training.tactical_bc --train --epochs 20
 
 KEY INVARIANTS:
   - agent.py must be at ZIP ROOT (not in a subfolder)
@@ -174,10 +176,9 @@ redqueen/
 │   ├── models/
 │   │   └── policy_network.py     # BomberPolicyNet (actor-critic) + BomberCNNExtractor (SB3)
 │   ├── training/
-│   │   ├── history_parser.py     # Phase 0: Extract BC data from history_game/
-│   │   ├── bc_trainer.py         # Phase 2: Behavioral Cloning (focal loss)
+│   │   ├── tactical_bc.py        # Phase 0+2: TacticalAgent self-rollout + BC training
 │   │   ├── ppo_trainer.py        # Phase 3-4: MaskablePPO + curriculum + self-play
-│   │   └── reward_v2.py          # Reward function v2 (contains v3 logic)
+│   │   └── reward.py             # Reward function (v4 logic, canonical name)
 │   ├── wrappers/
 │   │   └── bomberland_env.py     # Gymnasium single-agent wrapper for MaskablePPO
 │   └── utils/
@@ -335,7 +336,7 @@ Scalars 5–6 require external stat tracking (not in raw obs). Use `0.0` during 
 
 ## 7. Reward Function (v3 — Tie-break + Game-mechanics Aware)
 
-**File**: `src/training/reward_v2.py` (contains v3 logic).
+**File**: `src/training/reward.py` (v4 logic, canonical name).
 
 ### Reward Table
 
@@ -399,14 +400,13 @@ for row in prev_bombs:
 ## 8. Training Pipeline (v3 — 7-Stage Curriculum)
 
 ```
-Phase 0  History Mining     Extract BC data from history_game/
-  └─ Parser: src/training/history_parser.py
-  └─ Filter: rank=0 AND survival≥120 AND bombs_placed≥5
-  └─ Sources: top participant UUIDs (f9f492f0, cd455db7)
+Phase 0  BC Data Generation   Generate BC data via TacticalAgent self-rollout
+  └─ Script: python -m src.training.tactical_bc --generate --n-games 200
+  └─ Source: TacticalRuleAgent self-play games
   └─ Estimated yield: 40,000–80,000 quality (obs, action) pairs
-  └─ Fallback: GeniusRuleAgent self-rollout (5,000 games ≈ 650k transitions)
 
 Phase 2  Behavioral Cloning Supervised from Phase 0 data
+  └─ Script: python -m src.training.tactical_bc --train --epochs 20
   └─ Feature: 15-channel spatial + 7 aux scalars
   └─ Action Masking ACTIVE from this phase onward
   └─ Loss: Focal loss (γ=2) to handle class imbalance (PLACE_BOMB ~15%)
@@ -485,8 +485,8 @@ STAGE_LR = [3e-4, 1.5e-4, 1.2e-4, 1e-4, 8e-5, 8e-5, 5e-5]
 
 | Phase | Script | Key Flag | Checkpoint |
 |-------|--------|----------|-----------|
-| 0 | `history_parser.py` | `--extract` | `data/bc_dataset/` |
-| 2 | `bc_trainer.py` | `--train` | `bc_{epoch}ep_{ts}.pt` |
+| 0 | `tactical_bc.py` | `--generate` | `data/bc_dataset/` |
+| 2 | `tactical_bc.py` | `--train` | `bc_{epoch}ep_{ts}.pt` |
 | 3 | `ppo_trainer.py` | `--curriculum` | `ppo_{step}_{ts}.pt` |
 | 4 | `ppo_trainer.py` | `--self-play` | `selfplay_{step}_{ts}.pt` |
 | 5 | `league_trainer.py` | `--league` | `league_{step}_{ts}.pt` |
@@ -561,6 +561,10 @@ Steps: 200 games → win-rate ≥ 55% → log to `logs/gauntlet/` with timestamp
 
 Validate before every submission: `unzip -l submission.zip | grep agent.py` must show `agent.py` not `*/agent.py`.
 
+### Rule 5 — Notebook Sync Required
+> **After modifying any file in src/, review notebooks/train_on_kaggle.ipynb and update affected cells.**
+> Every function call in the notebook must pass all parameters explicitly.
+
 ---
 
 ## 12. Coding Standards
@@ -630,6 +634,23 @@ No. League Training is the mechanism for combining knowledge across model versio
 ## 14. Session Update Log
 *(Auto-appended by `scripts/pre_compact_update.py` before each compact)*
 
+### 2026-05-29 — Codebase cleaned: dead code removed, canonical naming
+- Renamed src/training/reward.py → src/training/reward.py (no version suffix)
+- Deleted: src/training/bc_trainer.py (replaced by tactical_bc.py)
+- Deleted: src/training/history_parser.py (no longer used)
+- Fixed bomb timer edge case in reward.py (timer==1 = about to explode)
+- Fixed blast expansion in feature_extractor.py (box blocks cells beyond it)
+- All imports updated to use src.training.reward
+- Notebooks cleaned: no hardcoded checkpoints, all params explicit
+
+### 2026-05-29 — Full overhaul: TacticalAgent BC + Reward v4 + Training fixes
+- Removed history_game BC; new tactical_bc.py for TacticalAgent self-rollout BC
+- Reward v4: win=5.0, death=-3.0, kill=2.5, box=0.5, late-game 1.3x multiplier (step>400)
+- Fixed: _set_lr() sets model.lr_schedule (lr no longer overridden per rollout)
+- Fixed: stage transition loads best_stage_checkpoint (not latest)
+- Fixed: optimizer state cleared on stage transition
+- Added Rule 5: Notebook Sync Required
+
 ### 2026-05-24 — Initial architecture established
 - Hybrid Nội Năng (PPO neural net) + Ngoại Công (Action Masking + BFS) architecture defined
 - 5-phase pipeline: History Mining → BC → PPO+Curriculum → Self-Play → League Training
@@ -656,6 +677,12 @@ No. League Training is the mechanism for combining knowledge across model versio
 - **Fix 3**: Stage 0→1: reload BC weights (not Stage 0 best) + clear optimizer state each stage start
 - Best Stage 1 result before fixes: avg_rank 1.30 at 650k, rolling mean never below 1.487 (threshold 1.2)
 
+### 2026-05-27 — 2 critical bugs found from Kaggle run log + full code audit
+- **Bug 1 (PRIMARY — LR never changed)**: `_set_lr()` patched `model.learning_rate` and `optimizer.param_groups[lr]` but NOT `model.lr_schedule`. SB3 calls `_update_learning_rate()` every rollout, which reads `lr_schedule` (not `learning_rate`) to override the optimizer — so intended 1.5e-4 Stage 1 LR was silently overwritten back to 3e-4 every rollout. TensorBoard confirmed: `learning_rate: 0.0003` for all 750k Stage 1 steps. Fix: add `model.lr_schedule = lambda _: lr` to `_set_lr()`.
+- **Bug 2 (SECONDARY — dead agent floods buffer)**: Engine returns `terminated = (alive_count <= 1)`. When our agent dies but 2+ enemies remain, `terminated=False` and the episode continues for up to 400+ steps where the agent is dead (action_mask forces STOP, small negative rewards). With n_envs=4 and avg death at step ~100, ~80% of rollout transitions were useless "dead" transitions diluting training data. Fix: `bomberland_env.py.step()` now sets `terminated = engine_terminated or (not our_alive)`.
+- **Evidence of Bug 1**: Stage 1 avg_rank at 50k = 2.22 (worse than random=1.5), never improved past 1.75 in 750k steps. With correct LR (1.5e-4), smaller initial KL → BC weights preserved → agent starts competent vs Simple agents.
+- Stage 0 passed cleanly: avg_rank 0.26 ≤ 0.8 at 150k steps (rolling mean 0.255)
+
 ---
 
 ## 15. CLI Reference
@@ -679,11 +706,11 @@ python scripts/replay_viewer.py history_game/YYYY-MM-DD/match_0001.json
 ### Training pipeline
 
 ```bash
-# Phase 0 — Extract BC data from history_game/
-python -m src.training.history_parser --extract
+# Phase 0 — Generate BC data via TacticalAgent self-rollout
+python -m src.training.tactical_bc --generate --n-games 200
 
 # Phase 2 — Behavioral Cloning
-python -m src.training.bc_trainer --train
+python -m src.training.tactical_bc --train --epochs 20
 
 # Phase 3 — PPO curriculum (init from BC checkpoint)
 python -m src.training.ppo_trainer --curriculum --init-from checkpoints/bc_10ep_<ts>.pt
