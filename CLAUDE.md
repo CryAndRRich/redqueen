@@ -33,6 +33,23 @@ KEY INVARIANTS:
   - STAGE_LR       = [3e-4, 1.5e-4, 1.2e-4, 1e-4, 8e-5, 8e-5, 5e-5]
   - MIN_STEPS_PER_STAGE = 100_000
   - Stage 0→1 transition: reload BC (not Stage 0 best) + clear optimizer state
+
+REWARD v4 (canonical, as of 2026-06-10):
+  win=5.0  death=-3.0  kill=2.5  box=0.5  late-game multiplier: smooth ramp ×1.0→×1.3 (steps 350→500)
+
+WRAPPERS / NORMALIZATION:
+  - VecNormalize applied to rewards at Phase 3+ (reward_normalization=True, norm_obs=False)
+  - Prevents reward scale mismatch across curriculum stages
+
+POLICY NETWORK (BomberCNNExtractor v2, as of 2026-06-10):
+  - ResNet-style CNN blocks in spatial encoder (skip connections)
+  - Orthogonal weight initialization throughout
+  - Larger MLP heads: 256 hidden units (was 128)
+
+SELF-PLAY OPPONENT SAMPLING (Phase 4, as of 2026-06-10):
+  - PFSP (Prioritized Fictitious Self-Play): blends recency decay (α=0.9^age) with
+    loss-rate weighting — opponents the agent loses to most are sampled more often
+  - selfplay_best.pt tracks best avg_rank (not latest snapshot)
 ```
 
 ---
@@ -415,7 +432,9 @@ Phase 2  Behavioral Cloning Supervised from Phase 0 data
 
 Phase 3  PPO + 7-Stage Curriculum   RL fine-tune from BC init
   └─ Action Masking: ACTIVE, hard-coded
-  └─ Reward: v3 (tie-break aware, correct box attribution)
+  └─ Reward: v4 (win=5.0, death=-3.0, kill=2.5, box=0.5, smooth late-game multiplier)
+  └─ VecNormalize: reward normalization active (norm_obs=False); prevents reward scale drift
+     across curriculum stages
   └─ SubprocVecEnv: 4–8 parallel environments
   └─ ent_coef schedule: 0.08 → 0.10 → 0.08 → 0.07 → 0.06 → 0.05 → 0.04
      (Stage 1 = 0.10: hardest distribution shift Random→Simple; 0.08 caused entropy
@@ -441,8 +460,13 @@ Phase 3  PPO + 7-Stage Curriculum   RL fine-tune from BC init
 
 Phase 4  Continuous Self-Play  PPO vs rolling Past Agents pool
   └─ Snapshot every 50k steps → Past Agents pool
-  └─ Sample weights: exponential decay (α=0.9^age) — favor recent snapshots
-  └─ Pool size: keep latest 20 snapshots
+  └─ PFSP opponent sampling: blends recency decay (α=0.9^age) with loss-rate weighting
+     (opponents the current policy loses to most are upsampled — prevents stagnation)
+  └─ Pool size: configurable via --pool-size CLI flag (default 20, forwarded correctly)
+  └─ selfplay_best.pt tracks checkpoint with best avg_rank (not latest)
+  └─ ent_coef=0.04, LR=5e-5 fixed at Phase 4 start (independent of PPO_DEFAULTS)
+  └─ Opponents resample on each episode reset (not once per rollout batch)
+  └─ VecNormalize reward normalization active (norm_obs=False, reward_normalization=True)
   └─ Checkpoint: selfplay_{step}_{timestamp}.pt
 
 Phase 5  League Training   Full league with 4-player matchmaking
@@ -633,6 +657,33 @@ No. League Training is the mechanism for combining knowledge across model versio
 
 ## 14. Session Update Log
 *(Auto-appended by `scripts/pre_compact_update.py` before each compact)*
+
+### 2026-06-10 — Comprehensive bug fixes + modern RL improvements
+
+**ppo_trainer.py fixes:**
+- Fixed self-play pool not updating: opponents now resample on each episode reset (not once per rollout)
+- Fixed `selfplay_best.pt` to track checkpoint with best avg_rank (was saving latest, not best)
+- Fixed self-play phase using PPO_DEFAULTS ent_coef/LR — now correctly fixed at ent_coef=0.04, LR=5e-5
+- Fixed `--pool-size` CLI flag not being forwarded into self-play loop (was silently ignored)
+- Fixed 20% random opponent mixing to correctly preserve anchor agent in curriculum stages 4–6
+- Fixed step counting to use `model.num_timesteps` (was double-counting in some paths)
+- Added VecNormalize reward normalization (norm_obs=False, reward_normalization=True) at Phase 3+
+- Added PFSP opponent sampling in self-play: blends recency decay with loss-rate weighting
+
+**reward.py (v4 consolidated):**
+- Canonical v4 values confirmed: win=5.0, death=-3.0, kill=2.5, box=0.5
+- `approach_enemy` reward gated behind step > 300 (prevents early aggression before items collected)
+- Late-game multiplier changed from hard step>400 cutoff to smooth ramp: ×1.0→×1.3 over steps 350→500
+- Added bomb efficiency penalty: -0.05 for wasted bomb placement (no box/enemy in blast range)
+
+**policy_network.py (BomberCNNExtractor v2):**
+- Added ResNet-style skip connections to CNN spatial encoder blocks
+- Applied orthogonal weight initialization throughout (policy, value, and CNN heads)
+- Enlarged MLP heads from 128 to 256 hidden units (actor and critic independently)
+
+**feature_extractor.py:**
+- Verified and fixed blast expansion consistency: channels 12–14 now use identical ray-marching
+  logic; previously ch 12/13 used a subtly different wall-blocking condition than ch 14
 
 ### 2026-05-29 — Codebase cleaned: dead code removed, canonical naming
 - Renamed src/training/reward.py → src/training/reward.py (no version suffix)

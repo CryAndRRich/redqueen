@@ -24,7 +24,10 @@ Phase 3  PPO + 7-Stage Curriculum  src/training/ppo_trainer.py --curriculum
            └─ Stage 0->1: reload BC (not Stage 0 best) + clear optimizer state
 
 Phase 4  Continuous Self-Play  ppo_trainer.py --self-play
-           └─ Rolling pool of past snapshots, exponential decay sampling
+           └─ Rolling pool of past snapshots, PFSP (Prioritized Fictitious Self-Play) sampling
+           └─ Snapshot saved to dated subdirectory (NOT overwriting selfplay_best.pt)
+           └─ VecNormalize applied for reward normalization
+           └─ ent_coef must match final curriculum stage (0.04) — not reset to higher value
 
 Phase 5  League Training  league_trainer.py --league
            └─ The Gauntlet: 200 games, win-rate >= 55% for promotion
@@ -33,19 +36,35 @@ Phase 5  League Training  league_trainer.py --league
 ## Reward Function
 **Current version: v4** (file: src/training/reward.py)
 
+Key v4 values (sentinel — verify after any edit):
+```python
+"win":           5.0    # (v3 was 3.0)
+"agent_death":  -3.0    # (v3 was -2.0)
+"kill_credit":   2.5    # (v3 was 2.0)
+"box_destroyed": 0.5    # (v3 was 0.4)
+```
 Key v4 additions over v3:
-- Late-game multiplier: reward scaling increases after step ~350 to bias toward kills/boxes
-- v3 base: kill_credit=2.0, box_destroyed=0.4, item_collected=0.3, chain_reaction=0.3
+- Late-game multiplier: step > 400 -> reward scale *= 1.3 (biases toward kills/boxes late)
+- approach_enemy gated: only rewarded when enemy is within actionable range
+- v3 base retained: item_collected=0.3, chain_reaction=0.3
 
 ## Key Files
 | File | Role |
 |------|------|
 | src/training/tactical_bc.py | Primary BC pipeline (replaces history_parser + bc_trainer) |
-| src/training/ppo_trainer.py | PPO curriculum + self-play |
+| src/training/ppo_trainer.py | PPO curriculum + self-play (6 bugs FIXED 2026-06-10) |
 | src/training/reward.py | Reward function v4 (current) |
 | src/logic/action_masking.py | PROTECTED — never edit without explicit instruction |
 | src/utils/feature_extractor.py | obs dict -> (15×13×13, 7) float32 |
+| src/models/policy_network.py | BomberPolicyNet with ResNet CNN extractor |
 | agent/agent.py | Submission entry point — ONNX inference only, no PyTorch |
+
+## Architecture Additions (2026-06-10)
+- **ResNet CNN** in `src/models/policy_network.py`: replaces the original shallow CNN extractor
+  with residual blocks for deeper spatial feature extraction without gradient vanishing
+- **VecNormalize**: applied in Phase 3/4 training for reward normalization (running mean/std)
+- **PFSP sampling**: Phase 4 self-play uses Prioritized Fictitious Self-Play — opponents sampled
+  proportional to win-rate difficulty against current policy (not pure exponential decay)
 
 ## Dead Files (removed 2026-05-29)
 - `src/training/bc_trainer.py` — superseded by tactical_bc.py

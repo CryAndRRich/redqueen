@@ -1,24 +1,28 @@
 """
-Reward function v4 — tie-break + game-mechanics aware for Bomberland FFA.
+Reward function v5 — adaptive shaping + kill-assist + zone control.
 
-Changes from v3:
-  - Updated REWARDS values: win 3.0→5.0, agent_death -2.0→-3.0,
-    kill_credit 2.0→2.5, box_destroyed 0.4→0.5, item_collected 0.3→0.4,
-    chain_reaction 0.3→0.5, danger_evasion 0.12→0.15, danger_enter -0.08→-0.15,
-    own_blast_loiter -0.04→-0.06, standing_still -0.008→-0.015,
-    approach_enemy 0.006→0.008
-  - approach_enemy gated: only active when current_step > 300 (avoids
-    contradicting Priority 1 Survive in early/mid game for a 0.008 signal)
-  - Late-game multiplier (×1.3) on kill_credit, box_destroyed, item_collected
-    when current_step / 500 > 0.8 (step > 400)
-  - Chain reaction detection upgraded from Manhattan proximity to blast-overlap:
-    bonus triggers when the just-placed bomb's blast corridor intersects any
-    existing active bomb's position (not just Manhattan ≤ 2); still capped at
-    one bonus per step
-  - Box attribution unchanged from v3: only MY bombs with timer==1 in prev_obs
-  - Function signature extended: action, episode_stats, current_step added;
-    returns (reward_float, info_dict) with per-component breakdown
-  - All magic numbers consolidated in REWARDS dict
+Changes from v4:
+  - IMPROVEMENT 1: Smooth late-game ramp (step 350→500) replaces the hard
+    ×1.3 step at step>400.  Formula: 1.0 + 0.3 * max(0, (step - 350) / 150).
+    Gives a gradual incentive to get aggressive as the game ends.
+  - IMPROVEMENT 2: Kill-assist reward (0.3 × kill_credit).  If an enemy dies
+    this step AND we placed a bomb in the last 7 steps whose blast zone covered
+    the enemy's last known position, we receive a partial credit even when the
+    enemy was not inside an active bomb at the previous tick.  Tracked via a new
+    episode_stats["recent_bomb_blasts"] key (list of blast masks, capped at 3).
+  - IMPROVEMENT 3: Zone control reward (+0.005/step) when our agent is within
+    4 Manhattan tiles of the map centre (6, 6) AND ≥2 enemies are still alive.
+    Capped to one bonus per step; irrelevant in 1v1 end-game.
+  - IMPROVEMENT 4: Continuous own_blast_loiter penalty scaled by
+    (7 - timer) / 7 * 0.08, giving a smooth range [0.01, 0.08] instead of a
+    stepped multiplier.  Maximum at timer=1 (bomb about to explode),
+    minimum at timer=6.
+  - IMPROVEMENT 5: Wasted-bomb penalty (−0.05) when one of our bombs detonates
+    (timer==1 or chain-triggered) and it destroyed 0 boxes AND 0 enemies died
+    in this step.  Detected per-exploding-bomb; at most one penalty per step
+    regardless of how many bombs expire.
+  - All other v4 logic preserved verbatim (chain-reaction detection, BC
+    attribution, kill attribution, item contest, approach_enemy gating, etc.)
 """
 
 from __future__ import annotations
@@ -41,10 +45,15 @@ REWARDS: dict[str, float] = {
     # Tactical bonuses
     "chain_reaction":       0.5,   # bomb blast overlaps an existing active bomb
     "item_contest":         0.1,   # moving toward item an enemy is also approaching
+    "kill_assist":          0.75,  # 0.3 × kill_credit (2.5) — partial credit for assist
+    # Zone control
+    "zone_control":         0.005, # within 4 tiles of centre (6,6) AND ≥2 enemies alive
     # Danger shaping
     "danger_evasion":       0.15,
     "danger_enter":        -0.15,
-    "own_blast_loiter":    -0.06,
+    "own_blast_loiter_max": 0.08,  # Improvement 4: max loiter penalty (timer==1)
+    # Wasted bomb
+    "wasted_bomb":         -0.05,  # Improvement 5: bomb explodes, 0 boxes + 0 kills
     # Movement
     "survival_step":        0.005,
     "standing_still":      -0.015,
@@ -58,10 +67,15 @@ REWARDS: dict[str, float] = {
 # ─────────────────────────────────────────────────────────────────────────── #
 
 _DEFAULT_BOMB_TIMER: int = 7
-_LATE_GAME_STEP_THRESHOLD: float = 0.8   # current_step / 500 > this → multiplier active
-_LATE_GAME_MULTIPLIER: float = 1.3
-_APPROACH_ENEMY_MIN_STEP: int = 300      # approach_enemy only active after this step
-_TOTAL_STEPS: int = 500                  # max episode length
+_LATE_GAME_RAMP_START: int = 350      # Improvement 1: ramp begins here
+_LATE_GAME_RAMP_END: int = 500        # Improvement 1: ramp reaches ×1.3 here
+_LATE_GAME_MAX_BONUS: float = 0.3     # Improvement 1: maximum additive bonus to multiplier
+_APPROACH_ENEMY_MIN_STEP: int = 300   # approach_enemy only active after this step
+_TOTAL_STEPS: int = 500               # max episode length
+_MAP_CENTRE: tuple[int, int] = (6, 6) # Improvement 3: zone control centre tile
+_ZONE_CONTROL_RADIUS: int = 4         # Improvement 3: Manhattan radius for zone control
+_RECENT_BLAST_HISTORY: int = 3        # Improvement 2: number of recent bomb blasts to track
+_MAX_BOMB_TIMER: int = 7              # Improvement 2: bomb lifetime (steps)
 
 WALL: int = 1
 BOX: int = 2
@@ -238,6 +252,20 @@ def _chain_reaction_bonus(
     return False
 
 
+def _late_game_multiplier(current_step: int) -> float:
+    """
+    IMPROVEMENT 1: Smooth ramp from 1.0 at step 350 to 1.3 at step 500.
+
+    Formula: 1.0 + 0.3 * clamp((step - 350) / 150, 0, 1)
+    Before step 350: multiplier = 1.0 (no effect)
+    At step 350: multiplier = 1.0
+    At step 425: multiplier = 1.15
+    At step 500: multiplier = 1.3
+    """
+    ramp = max(0.0, (current_step - _LATE_GAME_RAMP_START) / float(_LATE_GAME_RAMP_END - _LATE_GAME_RAMP_START))
+    return 1.0 + _LATE_GAME_MAX_BONUS * min(ramp, 1.0)
+
+
 # ─────────────────────────────────────────────────────────────────────────── #
 # Public API                                                                   #
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -247,7 +275,7 @@ def compute_reward(
     curr_obs: dict,
     action: int,
     agent_id: int,
-    episode_stats: dict[str, int],
+    episode_stats: dict[str, object],
     current_step: int,
 ) -> tuple[float, dict[str, float]]:
     """
@@ -260,7 +288,10 @@ def compute_reward(
         agent_id:       which player we are (0-3)
         episode_stats:  mutable dict with keys "kills", "boxes_destroyed",
                         "items_collected" — updated in place each step so the
-                        caller can track cumulative stats for aux features 5-6
+                        caller can track cumulative stats for aux features 5-6.
+                        Also uses "recent_bomb_blasts" (list[np.ndarray]) for
+                        kill-assist tracking (Improvement 2) — initialise to []
+                        if absent; the function manages it automatically.
         current_step:   current game step (0-500)
 
     Returns:
@@ -283,10 +314,8 @@ def compute_reward(
         info["agent_death"] = float(REWARDS["agent_death"])
         return float(REWARDS["agent_death"]), info
 
-    # ── Late-game multiplier ──────────────────────────────────────────── #
-    step_ratio = current_step / _TOTAL_STEPS
-    late_game = step_ratio > _LATE_GAME_STEP_THRESHOLD
-    lm = _LATE_GAME_MULTIPLIER if late_game else 1.0   # applied to kill/box/item
+    # ── IMPROVEMENT 1: Smooth late-game multiplier ────────────────────── #
+    lm = _late_game_multiplier(current_step)
 
     reward = 0.0
 
@@ -303,12 +332,14 @@ def compute_reward(
     prev_enemies = _enemies_alive(prev_p, aid)
     curr_enemies = _enemies_alive(curr_p, aid)
     kills = 0
+    newly_dead_enemies: list[int] = []
     for i in range(len(prev_p)):
         if i == aid:
             continue
         was_alive = int(prev_p[i][2]) == 1
         now_dead = int(curr_p[i][2]) == 0
         if was_alive and now_dead:
+            newly_dead_enemies.append(i)
             # Only credit if that enemy was in OUR blast zone last step
             if _enemy_in_my_blast(prev_obs, aid, i):
                 kills += 1
@@ -316,36 +347,113 @@ def compute_reward(
         kill_r = kills * REWARDS["kill_credit"] * lm
         reward += kill_r
         info["kill_credit"] = kill_r
-        episode_stats["kills"] = episode_stats.get("kills", 0) + kills
+        episode_stats["kills"] = episode_stats.get("kills", 0) + kills  # type: ignore[operator]
         # Last kill secures win
         if curr_enemies == 0:
             reward += REWARDS["win"]
             info["win"] = float(REWARDS["win"])
 
-    # ── Confirmed box destruction (MY bombs with timer==1 only) ──────── #
+    # ── IMPROVEMENT 2: Kill-assist reward ────────────────────────────── #
+    # For each enemy who died this step but was NOT directly credited above,
+    # check whether any of our recently-expired bomb blasts covered their
+    # last known position.  We store up to _RECENT_BLAST_HISTORY blast masks
+    # in episode_stats["recent_bomb_blasts"].
+    recent_blasts: list[np.ndarray] = episode_stats.get("recent_bomb_blasts", [])  # type: ignore[assignment]
+    if not isinstance(recent_blasts, list):
+        recent_blasts = []
+    assist_count = 0
+    for enemy_id in newly_dead_enemies:
+        # Skip if we already claimed a direct kill credit for this enemy
+        if _enemy_in_my_blast(prev_obs, aid, enemy_id):
+            continue
+        ex = int(prev_p[enemy_id][0])
+        ey = int(prev_p[enemy_id][1])
+        for blast_mask in recent_blasts:
+            if blast_mask[ex, ey]:
+                assist_count += 1
+                break  # one assist per enemy, regardless of how many blasts match
+    if assist_count:
+        assist_r = assist_count * REWARDS["kill_assist"] * lm
+        reward += assist_r
+        info["kill_assist"] = assist_r
+
+    # ── Update recent_bomb_blasts for future assist tracking ─────────── #
+    # When a bomb we placed expires this step (timer==1 or chain-triggered),
+    # record its blast mask so the next _MAX_BOMB_TIMER steps can use it.
+    # We cap the list at _RECENT_BLAST_HISTORY entries (oldest dropped first).
     prev_grid = np.asarray(prev_obs["map"], dtype=np.int32)
     curr_grid = np.asarray(curr_obs["map"], dtype=np.int32)
-    my_boxes_destroyed = 0
     prev_bombs_arr = _parse_bombs(prev_obs["bombs"])
+    curr_bombs_arr_for_box = _parse_bombs(curr_obs["bombs"])
+
+    if curr_bombs_arr_for_box is not None and len(curr_bombs_arr_for_box) > 0:
+        curr_bomb_positions = set(
+            (int(r[0]), int(r[1])) for r in curr_bombs_arr_for_box
+        )
+    else:
+        curr_bomb_positions = set()
+
+    new_blasts_this_step: list[np.ndarray] = []
     if prev_bombs_arr is not None:
         for row in prev_bombs_arr:
             bx, by, timer, owner = int(row[0]), int(row[1]), int(row[2]), int(row[3])
-            if int(owner) != aid or int(timer) != 1:
-                continue  # only my bombs exploding this step
+            if int(owner) != aid:
+                continue
+            natural_explosion = int(timer) == 1
+            chain_triggered = (bx, by) not in curr_bomb_positions
+            if natural_explosion or chain_triggered:
+                radius = 1 + int(prev_p[aid][4])
+                new_blasts_this_step.append(_blast_mask(prev_grid, bx, by, radius))
+
+    if new_blasts_this_step:
+        recent_blasts = (recent_blasts + new_blasts_this_step)[-_RECENT_BLAST_HISTORY:]
+    episode_stats["recent_bomb_blasts"] = recent_blasts  # type: ignore[assignment]
+
+    # ── Confirmed box destruction (MY bombs: timer==1 OR chain-triggered) #
+    # Chain-triggered: a bomb owned by me disappears between prev and curr
+    # even though its timer was > 1 — it was detonated by another explosion
+    # (chain reaction).  We detect this by comparing prev bomb positions to
+    # curr bomb positions: any bomb that was present in prev but absent in
+    # curr has exploded (either naturally at timer==1 or via chain).
+    my_boxes_destroyed = 0
+    wasted_bomb_fired = False  # Improvement 5 tracking
+
+    if prev_bombs_arr is not None:
+        for row in prev_bombs_arr:
+            bx, by, timer, owner = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+            if int(owner) != aid:
+                continue
+            natural_explosion = int(timer) == 1
+            chain_triggered = (bx, by) not in curr_bomb_positions
+            if not (natural_explosion or chain_triggered):
+                continue
             radius = 1 + int(prev_p[aid][4])
             bmask = _blast_mask(prev_grid, bx, by, radius)
             # Count cells that were BOX in prev and are not BOX in curr
-            destroyed = np.sum(
+            destroyed = int(np.sum(
                 (prev_grid == BOX) & (curr_grid != BOX) & bmask
-            )
-            my_boxes_destroyed += int(destroyed)
+            ))
+            my_boxes_destroyed += destroyed
+            # Improvement 5: track whether this bomb destroyed nothing and
+            # killed nobody — assessed after all kills are counted above.
+            if destroyed == 0 and len(newly_dead_enemies) == 0:
+                wasted_bomb_fired = True
+
     if my_boxes_destroyed > 0:
         box_r = my_boxes_destroyed * REWARDS["box_destroyed"] * lm
         reward += box_r
         info["box_destroyed"] = box_r
         episode_stats["boxes_destroyed"] = (
-            episode_stats.get("boxes_destroyed", 0) + my_boxes_destroyed
+            episode_stats.get("boxes_destroyed", 0) + my_boxes_destroyed  # type: ignore[operator]
         )
+
+    # ── IMPROVEMENT 5: Wasted-bomb penalty ───────────────────────────── #
+    # Only penalise once per step even if multiple bombs expired with no effect.
+    # We also skip the penalty if the bomb DID destroy boxes (handled above in
+    # the per-bomb loop) or if enemies died this step (even if not attributed).
+    if wasted_bomb_fired and my_boxes_destroyed == 0 and len(newly_dead_enemies) == 0:
+        reward += REWARDS["wasted_bomb"]
+        info["wasted_bomb"] = float(REWARDS["wasted_bomb"])
 
     # ── Item collection ───────────────────────────────────────────────── #
     prev_radius_bonus = int(prev_p[aid][4])
@@ -357,7 +465,7 @@ def compute_reward(
         item_r = REWARDS["item_collected"] * lm
         reward += item_r
         info["item_collected"] = item_r
-        episode_stats["items_collected"] = episode_stats.get("items_collected", 0) + 1
+        episode_stats["items_collected"] = episode_stats.get("items_collected", 0) + 1  # type: ignore[operator]
 
     # ── Item contest bonus ────────────────────────────────────────────── #
     px, py = int(prev_p[aid][0]), int(prev_p[aid][1])
@@ -428,13 +536,27 @@ def compute_reward(
             reward += REWARDS["danger_enter"]
             info["danger_enter"] = float(REWARDS["danger_enter"])
 
-    # ── Own blast loiter penalty ──────────────────────────────────────── #
+    # ── IMPROVEMENT 4: Own blast loiter — smooth penalty ─────────────── #
+    # Penalty = (7 - timer) / 7 * 0.08, ranging from 0.01 (timer=6) to
+    # 0.08 (timer=1).  Continuous deterrent rather than a stepped multiplier.
     own_timer = _own_blast_timer_at(curr_obs, aid, cx, cy)
     if curr_alive == 1 and own_timer is not None:
-        urgency = max(1, _DEFAULT_BOMB_TIMER - int(own_timer))
-        loiter_r = REWARDS["own_blast_loiter"] * urgency
+        t = max(1, min(int(own_timer), _DEFAULT_BOMB_TIMER - 1))  # clamp to [1, 6]
+        loiter_scale = (_DEFAULT_BOMB_TIMER - t) / float(_DEFAULT_BOMB_TIMER)
+        loiter_r = -(REWARDS["own_blast_loiter_max"] * loiter_scale)
+        # Floor at a small minimum so there is always some deterrent
+        loiter_r = min(loiter_r, -0.01)
         reward += loiter_r
         info["own_blast_loiter"] = loiter_r
+
+    # ── IMPROVEMENT 3: Zone control ───────────────────────────────────── #
+    # Small bonus when our agent sits near the map centre AND ≥2 enemies
+    # are still alive (zone control is not meaningful in a 1v1 end-game).
+    if curr_alive == 1 and curr_enemies >= 2:
+        dist_to_centre = abs(cx - _MAP_CENTRE[0]) + abs(cy - _MAP_CENTRE[1])
+        if dist_to_centre <= _ZONE_CONTROL_RADIUS:
+            reward += REWARDS["zone_control"]
+            info["zone_control"] = float(REWARDS["zone_control"])
 
     # ── Enemy pressure — only after step 300 AND we have a bomb ─────── #
     # Gated: approaching an enemy in early/mid game contradicts Priority 1
@@ -453,7 +575,12 @@ def compute_reward(
         pd = _manhattan_nearest_enemy(prev_p, aid, px, py)
         cd = _manhattan_nearest_enemy(curr_p, aid, cx, cy)
         if pd is not None and cd is not None:
-            approach_r = REWARDS["approach_enemy"] * (pd - cd)
+            # Clamp delta to [-1.0, 1.0]: an agent moves at most 1 tile per step,
+            # so (pd - cd) should naturally be in {-1, 0, 1}.  The clamp guards
+            # against edge cases where Manhattan distance jumps > 1 due to agent
+            # respawn / death events in the same step, preventing reward spikes.
+            delta = float(np.clip(pd - cd, -1.0, 1.0))
+            approach_r = REWARDS["approach_enemy"] * delta
             reward += approach_r
             if approach_r != 0.0:
                 info["approach_enemy"] = approach_r

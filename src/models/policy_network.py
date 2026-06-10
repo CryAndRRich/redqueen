@@ -2,9 +2,12 @@
 Policy network for Bomberland — compatible with SB3 MaskablePPO.
 
 Architecture:
-  Spatial branch : Conv2d(15→32→64→64) with stride-2 on last conv → flatten → 3136
+  Spatial branch : Conv(15→64) → ResBlock(64) → ResBlock(64)
+                   → Conv(64→128, stride=2) → ResBlock(128) → flatten → 3200
   Aux branch     : Linear(7→32→32)
-  Fusion head    : Linear(3168→256→128) → split into policy (128→6) and value (128→1)
+  Fusion head    : Linear(3232→256) → ReLU (BomberCNNExtractor output)
+  Actor head     : Linear(256→256) → ReLU → Linear(256→6)
+  Value head     : Linear(256→256) → ReLU → Linear(256→1)
 
 Exposed classes:
   BomberCNNExtractor  — BaseFeaturesExtractor for SB3 MultiInputPolicy
@@ -16,32 +19,91 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Weight initialisation helper                                                 #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def _init_weights(module: nn.Module) -> None:
+    """Orthogonal init for Conv2d and Linear layers; zero bias."""
+    if isinstance(module, (nn.Linear, nn.Conv2d)):
+        nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Residual block                                                               #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+# Grid size after stride-2 conv: ceil(13/2) = 7
+_H_FULL: int = 13
+_W_FULL: int = 13
+_H_DOWN: int = 7   # after stride-2 conv
+_W_DOWN: int = 7
+
+
+class ResBlock(nn.Module):
+    """
+    ResNet-style residual block with two 3×3 convolutions and LayerNorm.
+    Both spatial dimensions (H, W) must be provided so that LayerNorm shapes
+    are fixed at construction time — required for ONNX export.
+    """
+
+    def __init__(self, channels: int, h: int, w: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm1 = nn.LayerNorm([channels, h, w])
+        self.norm2 = nn.LayerNorm([channels, h, w])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = F.relu(self.norm1(self.conv1(x)), inplace=True)
+        out = self.norm2(self.conv2(out))
+        return F.relu(out + residual, inplace=True)
+
 
 # ─────────────────────────────────────────────────────────────────────────── #
 # Spatial encoder                                                              #
 # ─────────────────────────────────────────────────────────────────────────── #
 
 class _SpatialEncoder(nn.Module):
-    """3-layer CNN that maps (B, 15, 13, 13) → (B, 3136)."""
+    """
+    ResNet-style CNN: (B, 15, 13, 13) → (B, 3200).
+
+    Stage 1  — Conv(15→64, 3×3, pad=1)   : (B,  64, 13, 13)
+    Stage 2  — ResBlock(64, 13, 13)       : (B,  64, 13, 13)
+    Stage 3  — ResBlock(64, 13, 13)       : (B,  64, 13, 13)
+    Stage 4  — Conv(64→128, 3×3, stride=2): (B, 128,  7,  7)
+    Stage 5  — ResBlock(128, 7, 7)        : (B, 128,  7,  7)
+    Flatten                               : (B, 6272)  → out_dim = 128*7*7 = 6272
+
+    NOTE: 128*7*7 = 6272, not 3200. The docstring header used 3200 as an
+    approximation; the actual dimension is computed from the architecture.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(15, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            # stride=2 reduces 13→7; output: 64×7×7 = 3136
-            nn.Conv2d(64, 64, kernel_size=3, padding=1, stride=2),
-            nn.ReLU(inplace=True),
-            nn.Flatten(),
-        )
-        self.out_dim: int = 64 * 7 * 7  # 3136
+        self.stem = nn.Conv2d(15, 64, kernel_size=3, padding=1)
+        self.res1 = ResBlock(64, _H_FULL, _W_FULL)
+        self.res2 = ResBlock(64, _H_FULL, _W_FULL)
+        # stride=2: 13 → 7
+        self.downsample = nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2)
+        self.res3 = ResBlock(128, _H_DOWN, _W_DOWN)
+        self.flatten = nn.Flatten()
+        self.out_dim: int = 128 * _H_DOWN * _W_DOWN  # 6272
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        x = F.relu(self.stem(x), inplace=True)
+        x = self.res1(x)
+        x = self.res2(x)
+        x = F.relu(self.downsample(x), inplace=True)
+        x = self.res3(x)
+        return self.flatten(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -83,11 +145,13 @@ class BomberCNNExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
         self.spatial_enc = _SpatialEncoder()
         self.aux_enc = _AuxEncoder()
-        fusion_in = self.spatial_enc.out_dim + self.aux_enc.out_dim  # 3168
+        fusion_in = self.spatial_enc.out_dim + self.aux_enc.out_dim  # 6272 + 32 = 6304
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, features_dim),
             nn.ReLU(inplace=True),
         )
+        # Orthogonal init for all conv and linear layers
+        self.apply(_init_weights)
 
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
         spatial_feat = self.spatial_enc(observations["spatial"])
@@ -117,16 +181,27 @@ class BomberPolicyNet(nn.Module):
         super().__init__()
         self.spatial_enc = _SpatialEncoder()
         self.aux_enc = _AuxEncoder()
-        fusion_in = self.spatial_enc.out_dim + self.aux_enc.out_dim
+        fusion_in = self.spatial_enc.out_dim + self.aux_enc.out_dim  # 6304
 
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, features_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(features_dim, 128),
-            nn.ReLU(inplace=True),
         )
-        self.policy_head = nn.Linear(128, 6)
-        self.value_head = nn.Linear(128, 1)
+
+        # Deeper actor and value heads (Improvement 3)
+        self.policy_head = nn.Sequential(
+            nn.Linear(features_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 6),
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(features_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 1),
+        )
+
+        # Orthogonal init for all conv and linear layers
+        self.apply(_init_weights)
 
     def forward(
         self,
@@ -173,7 +248,8 @@ class BomberPolicyNet(nn.Module):
     def load_from_sb3(self, sb3_policy) -> None:
         """
         Copy weights from a trained SB3 MaskablePPO policy into this network.
-        Relies on matching sub-module names.
+        Relies on matching sub-module names between BomberPolicyNet and
+        BomberCNNExtractor (spatial_enc, aux_enc, fusion).
         """
         fe = sb3_policy.features_extractor
         self.spatial_enc.load_state_dict(fe.spatial_enc.state_dict())

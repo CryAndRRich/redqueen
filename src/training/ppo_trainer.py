@@ -58,7 +58,7 @@ def _make_maskable_ppo():
 
 PPO_DEFAULTS: dict = {
     "learning_rate":   3e-4,
-    "n_steps":         2048,
+    "n_steps":         2048,   # per env per rollout; with n_envs=8 → 16,384 samples/rollout
     "batch_size":      256,
     "n_epochs":        10,
     "gamma":           0.995,
@@ -67,6 +67,8 @@ PPO_DEFAULTS: dict = {
     "ent_coef":        0.03,   # overridden at runtime by STAGE_ENT_COEF[stage_idx]; this default is never used
     "vf_coef":         0.5,
     "max_grad_norm":   0.5,
+    # For Kaggle T4: n_envs=8 recommended for faster exploration (default CLI value).
+    # n_envs=4 is safe on CPU-only machines but halves exploration throughput.
 }
 
 # Curriculum stages: (opponent_fn_name, avg_rank_threshold)
@@ -114,13 +116,19 @@ MIN_STEPS_PER_STAGE = 100_000
 # Opponent factories                                                           #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-def _make_opponents(stage_name: str, opp_ids: list[int], mix_random: bool = False):
+def _make_opponents(stage_name: str, opp_ids: list[int], mix_random: bool = False,
+                    stage_idx: int = 0):
     """
     Return list of 3 opponent agents for a given curriculum stage.
 
     mix_random: if True, replace one opponent with RandomAgent with 20% probability.
     This prevents co-adaptation with specific opponents (Territory Paint Wars, 2024).
     Only applied to training envs, not evaluation envs.
+
+    stage_idx: used to determine which opponent slot receives the random substitution.
+    Stages 0-3: replace opps[-1] (last slot, no hard anchor yet).
+    Stages 4-6: replace opps[0] (primary/strongest slot), preserving opps[-1] anchor
+                which is a weaker rule agent providing an anti-forgetting signal.
     """
     from agent import (
         GeniusRuleAgent, TacticalRuleAgent, TrapperRuleAgent,
@@ -151,10 +159,14 @@ def _make_opponents(stage_name: str, opp_ids: list[int], mix_random: bool = Fals
     else:
         raise ValueError(f"Unknown stage: {stage_name}")
 
-    # 20% random mixing: replace last opponent with RandomAgent.
+    # 20% random mixing: replace one opponent with RandomAgent.
     # Prevents policy from overfitting to specific opponent behaviors (co-adaptation).
+    # Stages 0-3: replace last slot (no anchor to protect).
+    # Stages 4-6: replace first slot (primary/strongest opponent) to preserve the
+    # anchor in opps[-1] which prevents catastrophic forgetting of earlier skills.
     if mix_random and random.random() < 0.20:
-        opps[-1] = RandomAgent(opp_ids[-1])
+        mix_slot = 0 if stage_idx >= 4 else len(opps) - 1
+        opps[mix_slot] = RandomAgent(opp_ids[mix_slot])
 
     return opps
 
@@ -163,42 +175,125 @@ def _make_opponents(stage_name: str, opp_ids: list[int], mix_random: bool = Fals
 # Environment factory                                                          #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-def _make_env_fn(stage_name: str, seed: int, agent_id: int = 0, mix_random: bool = False) -> Callable:
+def _make_env_fn(stage_name: str, seed: int, agent_id: int = 0, mix_random: bool = False,
+                 stage_idx: int = 0) -> Callable:
     """Return a callable that creates a SingleAgentBomberEnv (for VecEnv).
     mix_random=True for training envs only; always False for eval envs.
+    stage_idx is forwarded to _make_opponents to determine the random-mix slot.
     """
     def _factory():
         from src.wrappers.bomberland_env import SingleAgentBomberEnv
         all_ids = list(range(4))
         all_ids.remove(agent_id)
-        opps = _make_opponents(stage_name, all_ids, mix_random=mix_random)
+        opps = _make_opponents(stage_name, all_ids, mix_random=mix_random, stage_idx=stage_idx)
         env = SingleAgentBomberEnv(opponents=opps, agent_id=agent_id, seed=seed)
         return env
     return _factory
+
+
+def _compute_pfsp_weights(
+    snapshots: list,
+    win_rate_table: dict,
+    pfsp_temperature: float = 1.0,
+    recency_alpha: float = 0.9,
+    pfsp_blend: float = 0.7,
+) -> np.ndarray:
+    """Compute blended PFSP + recency sampling weights for a list of snapshots.
+
+    PFSP weight (AlphaStar-style): weight_i = (1 - win_rate_i) ^ (1/temperature).
+    A win_rate_i of 0.0 means the opponent always beats us → highest priority.
+    A win_rate_i of 1.0 means we always beat them → lowest priority.
+
+    When no eval data exists yet for a snapshot (not in win_rate_table), the weight
+    falls back to 0.5 (neutral: we are equally likely to win or lose).
+
+    Recency weight: exponential decay with alpha=0.9 so older snapshots are
+    down-weighted relative to recent ones (independent of PFSP signal).
+
+    Final weight = pfsp_blend * pfsp_weight + (1 - pfsp_blend) * recency_weight.
+    Both components are L1-normalised before blending.
+
+    Args:
+        snapshots:         Ordered list of Path objects (oldest → newest).
+        win_rate_table:    Dict mapping str(checkpoint_path) → win_rate in [0, 1].
+        pfsp_temperature:  Temperature for PFSP exponent (1.0 = default prioritized).
+        recency_alpha:     Decay factor for recency weights (0.9 default).
+        pfsp_blend:        Weight given to PFSP signal vs recency (0.7/0.3 default).
+
+    Returns:
+        Normalised probability array of shape (len(snapshots),).
+    """
+    n = len(snapshots)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+
+    # PFSP weights: high when opponent beats us often.
+    pfsp_raw = np.array(
+        [1.0 - win_rate_table.get(str(s), 0.5) for s in snapshots],
+        dtype=np.float64,
+    )
+    # Apply temperature scaling: weight = loss_rate ^ (1 / temperature).
+    pfsp_raw = np.power(pfsp_raw, 1.0 / max(pfsp_temperature, 1e-6))
+    pfsp_sum = pfsp_raw.sum()
+    pfsp_w = pfsp_raw / pfsp_sum if pfsp_sum > 0 else np.ones(n) / n
+
+    # Recency weights: newest snapshot gets weight 1.0, oldest gets 0.9^(n-1).
+    recency_raw = np.array([recency_alpha ** i for i in range(n - 1, -1, -1)], dtype=np.float64)
+    recency_sum = recency_raw.sum()
+    recency_w = recency_raw / recency_sum if recency_sum > 0 else np.ones(n) / n
+
+    # Blend and renormalise.
+    combined = pfsp_blend * pfsp_w + (1.0 - pfsp_blend) * recency_w
+    combined_sum = combined.sum()
+    return combined / combined_sum if combined_sum > 0 else np.ones(n) / n
 
 
 def _make_self_play_env_fn(
     snapshot_dir: Path,
     seed: int,
     agent_id: int = 0,
+    pool_ref: list | None = None,
+    win_rate_table_ref: dict | None = None,
 ) -> Callable:
-    """Create env where 3 opponents are sampled from Past Agent snapshots."""
+    """Create env where 3 opponents are sampled from Past Agent snapshots.
+
+    pool_ref: shared mutable list of snapshot Path objects.  On each episode
+    reset the env factory re-samples from pool_ref so opponent quality updates
+    automatically after each snapshot interval without recreating the VecEnv.
+    If pool_ref is None or empty, falls back to reading snapshot_dir directly.
+
+    win_rate_table_ref: shared mutable dict mapping str(checkpoint_path) →
+    win_rate.  When populated by the PFSP eval loop, sampling uses blended
+    PFSP + recency weights so opponents we currently LOSE to are sampled more
+    often.  Falls back to pure recency weighting when the dict is empty.
+    """
+    # Use an empty list sentinel so the factory always has a mutable reference.
+    _pool: list = pool_ref if pool_ref is not None else []
+    _win_rate_table: dict = win_rate_table_ref if win_rate_table_ref is not None else {}
+
     def _factory():
         from src.wrappers.bomberland_env import SingleAgentBomberEnv
-        from src.inference.past_agent import PastAgentWrapper  # see below
 
         all_ids = list(range(4))
         all_ids.remove(agent_id)
 
-        snapshots = sorted(snapshot_dir.glob("*.pt"))
+        # Use pool_ref contents if available; otherwise fall back to snapshot_dir scan.
+        snapshots = list(_pool) if _pool else sorted(snapshot_dir.glob("*.pt"))
+
         if not snapshots:
             # Diverse fallback before any snapshots exist: mix tactical + genius
             from agent import GeniusRuleAgent, TacticalRuleAgent, TrapperRuleAgent
             opps = [TrapperRuleAgent(all_ids[0]), TacticalRuleAgent(all_ids[1]), GeniusRuleAgent(all_ids[2])]
         else:
-            # Exponential-decay weighted sampling (recent snapshots preferred)
-            weights = np.array([0.9 ** i for i in range(len(snapshots) - 1, -1, -1)])
-            weights /= weights.sum()
+            from src.inference.past_agent import PastAgentWrapper
+            # PFSP-blended weights: prioritise opponents we lose to most often.
+            # Falls back to pure recency weighting when win_rate_table is empty.
+            if _win_rate_table:
+                weights = _compute_pfsp_weights(snapshots, _win_rate_table)
+            else:
+                # Pre-PFSP fallback: exponential-decay recency only.
+                weights = np.array([0.9 ** i for i in range(len(snapshots) - 1, -1, -1)])
+                weights /= weights.sum()
             chosen = np.random.choice(snapshots, size=3, replace=True, p=weights)
             opps = [PastAgentWrapper(str(c), i) for c, i in zip(chosen, all_ids)]
 
@@ -401,8 +496,8 @@ class CurriculumAdvanceCallback:
         self._steps_in_stage: int = 0
         self.stage_passed: bool = False
 
-    def evaluate(self, model) -> float:
-        """Run n_eval_episodes, return average rank (lower is better).
+    def evaluate(self, model) -> tuple[float, dict[str, float]]:
+        """Run n_eval_episodes, return (average rank, reward component averages).
 
         Rank scale: 0=win (sole survivor), 3=died early.
 
@@ -418,18 +513,35 @@ class CurriculumAdvanceCallback:
 
           Old integer formula (n_alive-1)//2 gave rank=0 for n_alive=2 draws, treating
           "survived with one enemy alive" the same as "won outright" — fixed to float.
+
+        Returns:
+            avg_rank: float — lower is better.
+            reward_component_avgs: dict mapping reward component name to mean value
+                across all eval episodes (e.g. "kill_credit", "box_destroyed").
+                Useful for TensorBoard logging to diagnose reward signal quality.
         """
         env = self.eval_env_fn()
         total_rank = 0.0
+        # IMPROVEMENT 4 — accumulate per-episode reward_info breakdowns for TensorBoard.
+        # reward_info is the per-step dict returned by compute_reward(); info["reward_info"]
+        # is the LAST step's breakdown.  We accumulate per-episode sums so we can log
+        # average kill/box/danger reward magnitudes, helping diagnose whether each
+        # reward component is firing at the expected frequency during evaluation.
+        component_sums: dict[str, float] = {}
         for ep in range(self.n_eval_episodes):
             obs, _ = env.reset(seed=ep)
             done = False
             final_info: dict = {}
+            ep_components: dict[str, float] = {}
             while not done:
                 mask = env.action_masks()
                 action, _ = model.predict(obs, action_masks=mask, deterministic=True)
                 obs, _, terminated, truncated, final_info = env.step(int(action))
                 done = terminated or truncated
+                # Accumulate reward_info for every step in this episode.
+                step_reward_info = final_info.get("reward_info", {})
+                for k, v in step_reward_info.items():
+                    ep_components[k] = ep_components.get(k, 0.0) + float(v)
             raw = env.raw_obs
             if raw is not None:
                 alive = [int(raw["players"][i][2]) for i in range(4)]
@@ -448,19 +560,38 @@ class CurriculumAdvanceCallback:
             else:
                 rank = 3.0
             total_rank += rank
+            for k, v in ep_components.items():
+                component_sums[k] = component_sums.get(k, 0.0) + v
         env.close()
-        return total_rank / self.n_eval_episodes
+        n = max(self.n_eval_episodes, 1)
+        reward_component_avgs = {k: v / n for k, v in component_sums.items()}
+        return total_rank / n, reward_component_avgs
 
     def check(self, model, steps_this_iter: int = 50_000) -> bool:
         """Return True if curriculum should advance.
 
         Rolling-mean advancement: average of last 3 eval windows ≤ threshold.
         Requires at least min_steps in this stage (consolidation guard).
+
+        IMPROVEMENT 4 — logs reward component breakdown to TensorBoard after each
+        eval window so training dashboards show kill/box/danger reward magnitudes
+        alongside avg_rank.  Helps diagnose whether the reward signal is healthy
+        (e.g. kill_credit near-zero indicates agent is not placing effective bombs).
         """
         self._steps_in_stage += steps_this_iter
-        avg_rank = self.evaluate(model)
+        avg_rank, reward_component_avgs = self.evaluate(model)
         self._history.append(avg_rank)
         print(f"  Avg rank: {avg_rank:.2f} (threshold ≤ {self.threshold:.1f})")
+        # Log reward breakdown to TensorBoard via model.logger.record().
+        # Each component is logged under eval/reward_<name> so it appears as a
+        # separate curve in TensorBoard — visible alongside policy/value_loss.
+        try:
+            model.logger.record("eval/avg_rank", avg_rank)
+            for component_name, component_mean in reward_component_avgs.items():
+                model.logger.record(f"eval/reward_{component_name}", component_mean)
+            model.logger.dump(step=model.num_timesteps)
+        except Exception:
+            pass  # logger may not be initialised before first learn() call
 
         # Consolidation guard: enforce minimum steps before advancing
         if self._steps_in_stage < self.min_steps:
@@ -514,7 +645,7 @@ def train_curriculum(
     """
     import warnings
     import torch
-    from stable_baselines3.common.vec_env import SubprocVecEnv
+    from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
     # Suppress SB3 net_arch deprecation warning
     warnings.filterwarnings("ignore", message=".*shared layers.*", category=UserWarning)
@@ -531,16 +662,53 @@ def train_curriculum(
     tb_log_dir = str(log_dir) if log_dir is not None else str(output_dir / "tb_logs")
     best_ckpt = output_dir / "ppo_curriculum_best.pt"
 
+    # To enable mixed precision (requires PyTorch 2.0+):
+    #   model.policy.set_training_mode(True)
+    #   scaler = torch.cuda.amp.GradScaler()
+    # Note: not directly supported by SB3, requires custom callback.
+
     model = None
     all_stages_passed = True
+    vec_env = None
 
     for stage_idx, (stage_name, wr_thresh) in enumerate(CURRICULUM_STAGES):
         print(f"\n=== Curriculum Stage {stage_idx}: {stage_name} (avg_rank threshold ≤ {wr_thresh:.1f}) ===")
 
         # Training envs use mix_random=True (20% random opponent substitution).
         # Eval env uses mix_random=False for consistent, deterministic evaluation.
-        env_fns = [_make_env_fn(stage_name, seed=stage_idx * 1000 + i, mix_random=True) for i in range(n_envs)]
-        vec_env = SubprocVecEnv(env_fns)
+        env_fns = [
+            _make_env_fn(stage_name, seed=stage_idx * 1000 + i, mix_random=True, stage_idx=stage_idx)
+            for i in range(n_envs)
+        ]
+        # IMPROVEMENT 1 — VecNormalize for reward normalization.
+        # norm_obs=False: observations are already normalized in feature_extractor.py.
+        # norm_reward=True: running mean/std normalization stabilises value function learning.
+        # clip_reward=10.0: clips normalized rewards to [-10, 10] to bound outliers.
+        # gamma matches PPO_DEFAULTS["gamma"] so the return estimate is consistent.
+        # VecNormalize stats (mean/var) are saved at each stage transition and reloaded
+        # at the start of the next stage so the normalizer is not reset mid-curriculum.
+        vecnorm_path = output_dir / f"vecnormalize_{stage_idx}.pkl"
+        raw_vec_env = SubprocVecEnv(env_fns)
+        if vecnorm_path.exists():
+            # Reload stats saved at the end of this stage's previous run (if resuming).
+            vec_env = VecNormalize.load(str(vecnorm_path), raw_vec_env)
+            vec_env.training = True
+            print(f"  Loaded VecNormalize stats from {vecnorm_path.name}")
+        else:
+            # Check if the previous stage's stats exist and use as a warm start.
+            prev_vecnorm_path = output_dir / f"vecnormalize_{stage_idx - 1}.pkl"
+            if stage_idx > 0 and prev_vecnorm_path.exists():
+                vec_env = VecNormalize.load(str(prev_vecnorm_path), raw_vec_env)
+                vec_env.training = True
+                print(f"  Warm-started VecNormalize stats from stage {stage_idx - 1} ({prev_vecnorm_path.name})")
+            else:
+                vec_env = VecNormalize(
+                    raw_vec_env,
+                    norm_obs=False,
+                    norm_reward=True,
+                    clip_reward=10.0,
+                    gamma=PPO_DEFAULTS["gamma"],
+                )
 
         if model is None:
             model = MaskablePPO(
@@ -572,7 +740,7 @@ def train_curriculum(
             _set_lr(model, STAGE_LR[stage_idx])
             print(f"  ent_coef={STAGE_ENT_COEF[stage_idx]}, lr={STAGE_LR[stage_idx]:.1e} (reset) for stage {stage_idx}")
 
-        eval_fn = _make_env_fn(stage_name, seed=9999, mix_random=False)
+        eval_fn = _make_env_fn(stage_name, seed=9999, mix_random=False, stage_idx=stage_idx)
         cb = CurriculumAdvanceCallback(
             eval_fn,
             n_eval_episodes=eval_episodes,
@@ -587,6 +755,11 @@ def train_curriculum(
         stage_best_rank = float("inf")
         stage_best_ckpt = output_dir / f"ppo_s{stage_idx}_best.pt"
 
+        # FIX 6: Record model.num_timesteps at stage start for accurate per-stage
+        # step counting.  model.num_timesteps is the authoritative counter maintained
+        # by SB3 across learn() calls; steps_done was an approximation that drifted
+        # when eval_freq didn't align with actual rollout lengths.
+        stage_start_timesteps: int = model.num_timesteps
         steps_done = 0
         while steps_done < total_steps_per_stage:
             model.learn(
@@ -594,26 +767,33 @@ def train_curriculum(
                 reset_num_timesteps=False,
                 tb_log_name=f"stage_{stage_idx}_{stage_name}",
             )
-            steps_done += eval_freq
+            # Use the authoritative timestep delta for both loop guard and cb.check().
+            _steps_in_stage = model.num_timesteps - stage_start_timesteps
+            steps_done = _steps_in_stage
 
             ts = time.strftime("%Y%m%d_%H%M%S")
             ckpt = output_dir / f"ppo_s{stage_idx}_{steps_done}steps_{ts}.pt"
             _save_sb3_weights(model, ckpt)
             print(f"  Saved {ckpt.name}")
 
-            advanced = cb.check(model, steps_this_iter=eval_freq)
+            advanced = cb.check(model, steps_this_iter=_steps_in_stage - cb._steps_in_stage)
 
             # Save stage-best checkpoint when a new best avg_rank is achieved.
             last_rank = cb._history[-1]
             if last_rank < stage_best_rank:
                 stage_best_rank = last_rank
                 _save_sb3_weights(model, stage_best_ckpt)
-                print(f"  → Stage best: avg_rank {stage_best_rank:.2f} → {stage_best_ckpt.name}")
+                print(f"  Stage best: avg_rank {stage_best_rank:.2f} -> {stage_best_ckpt.name}")
 
             if advanced:
-                print(f"  → Stage {stage_name} passed! Advancing.")
+                print(f"  Stage {stage_name} passed! Advancing.")
                 break
 
+        # IMPROVEMENT 1 — save VecNormalize running stats before closing.
+        # Persists reward mean/var so the next stage warm-starts from the
+        # current normalizer rather than resetting it to zero.  Loaded at the
+        # top of the next iteration via prev_vecnorm_path.
+        vec_env.save(str(vecnorm_path))
         vec_env.close()
 
         # Copy stage best into the overall best checkpoint.
@@ -669,8 +849,21 @@ def train_self_play(
     init_from: Path | None = None,
     device: str = "auto",
     log_dir: Path | None = None,
+    pool_size: int = 20,
 ) -> Path:
-    """Phase 4: continuous self-play PPO training."""
+    """Phase 4: continuous self-play PPO training.
+
+    FIX 1: Uses a shared mutable pool_ref list so opponent envs automatically
+    pick up new snapshots on the next episode reset without recreating VecEnv.
+
+    FIX 2: selfplay_best.pt tracks the BEST avg_rank (vs genius opponents) rather
+    than unconditionally overwriting on every snapshot interval.
+
+    FIX 3: Model is initialised with STAGE_LR[-1] and STAGE_ENT_COEF[-1] (the
+    final curriculum stage hyperparameters) instead of PPO_DEFAULTS.
+
+    FIX 4: pool_size parameter controls how many past snapshots are retained.
+    """
     import warnings
     import torch
     from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -688,7 +881,22 @@ def train_self_play(
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     tb_log_dir = str(log_dir) if log_dir is not None else str(output_dir / "tb_logs")
 
-    env_fns = [_make_self_play_env_fn(snapshot_dir, seed=i) for i in range(n_envs)]
+    # FIX 1: Shared mutable pool that all env factories read on each episode reset.
+    # After saving a snapshot we update pool_ref in-place; no VecEnv recreation needed.
+    pool_ref: list = []
+
+    # PFSP: shared win_rate_table populated after each eval window.
+    # Maps str(snapshot_path) → win_rate of the current agent against that snapshot.
+    # win_rate = (wins + 0.5 * draws) / n_games, where wins = agent rank==0.
+    # Initially empty; env factories fall back to pure recency until first PFSP eval.
+    win_rate_table: dict[str, float] = {}
+
+    env_fns = [
+        _make_self_play_env_fn(
+            snapshot_dir, seed=i, pool_ref=pool_ref, win_rate_table_ref=win_rate_table
+        )
+        for i in range(n_envs)
+    ]
     vec_env = SubprocVecEnv(env_fns)
 
     model = MaskablePPO(
@@ -708,9 +916,96 @@ def train_self_play(
     if init_from and init_from.exists():
         _load_bc_into_sb3(model, init_from, device)
 
+    # FIX 3: Self-play uses the final curriculum stage hyperparameters, not PPO_DEFAULTS.
+    # STAGE_LR[-1] = 5e-5 and STAGE_ENT_COEF[-1] = 0.04 match the Stage 6 (genius) regime
+    # the policy was trained under last, preventing a jarring hyperparameter discontinuity.
+    _set_lr(model, STAGE_LR[-1])
+    model.ent_coef = STAGE_ENT_COEF[-1]
+    print(f"  Self-play init: ent_coef={STAGE_ENT_COEF[-1]}, lr={STAGE_LR[-1]:.1e}")
+
     steps_done = 0
     snap_count = 0
     best_ckpt = output_dir / "selfplay_best.pt"
+    # FIX 2: Track best avg_rank across eval windows (evaluated vs genius opponents).
+    best_selfplay_rank: float = float("inf")
+
+    # Eval env for FIX 2: fixed genius opponents so rank is comparable across intervals.
+    eval_env_fn = _make_env_fn("genius", seed=9999, mix_random=False, stage_idx=6)
+
+    # Lightweight rank evaluator for self-play (reuses CurriculumAdvanceCallback.evaluate logic).
+    def _eval_vs_genius(n_episodes: int = 100) -> float:
+        env = eval_env_fn()
+        total_rank = 0.0
+        for ep in range(n_episodes):
+            obs, _ = env.reset(seed=ep)
+            done = False
+            final_info: dict = {}
+            while not done:
+                mask = env.action_masks()
+                action, _ = model.predict(obs, action_masks=mask, deterministic=True)
+                obs, _, terminated, truncated, final_info = env.step(int(action))
+                done = terminated or truncated
+            raw = env.raw_obs
+            if raw is not None:
+                alive = [int(raw["players"][i][2]) for i in range(4)]
+                n_alive = sum(alive)
+                if not alive[0]:
+                    rank = 3.0
+                elif n_alive == 1:
+                    rank = 0.0
+                else:
+                    agent_kills = final_info.get("kills", 0)
+                    rank = 0.0 if agent_kills > 0 else (n_alive - 1) / 2.0
+            else:
+                rank = 3.0
+            total_rank += rank
+        env.close()
+        return total_rank / n_episodes
+
+    def _eval_win_rate_vs_snapshot(snap_path: Path, n_episodes: int = 30) -> float:
+        """Evaluate win rate of the current model against a single past snapshot.
+
+        Uses a 1v1-style env: the snapshot fills all 3 opponent slots so the
+        measurement is purely about this opponent's difficulty.  Returns win_rate
+        in [0, 1] where 1.0 = we win every game, 0.0 = we lose every game.
+
+        Used by the PFSP update loop to populate win_rate_table after each
+        eval window.  30 episodes per snapshot gives a fast but noisy signal;
+        enough to distinguish "clearly beats us" from "we dominate".
+        """
+        from src.inference.past_agent import PastAgentWrapper
+        from src.wrappers.bomberland_env import SingleAgentBomberEnv
+
+        all_ids = list(range(4))
+        all_ids.remove(0)  # always evaluate as agent_id=0
+        try:
+            opps = [PastAgentWrapper(str(snap_path), i) for i in all_ids]
+            env = SingleAgentBomberEnv(opponents=opps, agent_id=0, seed=42)
+        except Exception:
+            # Snapshot may be partially written; skip gracefully.
+            return 0.5
+
+        wins = 0.0
+        for ep in range(n_episodes):
+            obs, _ = env.reset(seed=ep)
+            done = False
+            final_info: dict = {}
+            while not done:
+                mask = env.action_masks()
+                action, _ = model.predict(obs, action_masks=mask, deterministic=True)
+                obs, _, terminated, truncated, final_info = env.step(int(action))
+                done = terminated or truncated
+            raw = env.raw_obs
+            if raw is not None:
+                alive = [int(raw["players"][i][2]) for i in range(4)]
+                n_alive = sum(alive)
+                if alive[0] and n_alive == 1:
+                    wins += 1.0  # sole survivor
+                elif alive[0]:
+                    agent_kills = final_info.get("kills", 0)
+                    wins += 0.5 if agent_kills > 0 else 0.0  # partial credit for draw with kills
+        env.close()
+        return wins / max(n_episodes, 1)
 
     while steps_done < total_steps:
         model.learn(total_timesteps=snapshot_every, reset_num_timesteps=False)
@@ -720,14 +1015,60 @@ def train_self_play(
         ts = time.strftime("%Y%m%d_%H%M%S")
         snap_path = snapshot_dir / f"snapshot_{steps_done}steps_{ts}.pt"
         _save_sb3_weights(model, snap_path)
-        _save_sb3_weights(model, best_ckpt)
 
-        # Prune old snapshots (keep latest 20)
+        # FIX 1: Update pool_ref in-place after saving the new snapshot.
+        # Opponent envs will read the updated list on their next episode reset.
         all_snaps = sorted(snapshot_dir.glob("snapshot_*.pt"), key=lambda p: p.stat().st_mtime)
-        for old in all_snaps[:-20]:
+        # FIX 4: Use pool_size parameter instead of hardcoded [:-20].
+        for old in all_snaps[:-pool_size]:
             old.unlink(missing_ok=True)
+        # Refresh pool_ref with the surviving (pruned) snapshot list.
+        kept_snaps = sorted(snapshot_dir.glob("snapshot_*.pt"), key=lambda p: p.stat().st_mtime)
+        pool_ref.clear()
+        pool_ref.extend(kept_snaps)
 
-        print(f"Step {steps_done}/{total_steps} — snapshot {snap_count} saved")
+        # FIX 2: Evaluate vs fixed genius opponents; only update best_ckpt on improvement.
+        avg_rank = _eval_vs_genius(n_episodes=100)
+        print(f"Step {steps_done}/{total_steps} | snapshot {snap_count} | avg_rank vs genius: {avg_rank:.3f}")
+        if avg_rank < best_selfplay_rank:
+            best_selfplay_rank = avg_rank
+            _save_sb3_weights(model, best_ckpt)
+            print(f"  New best selfplay: avg_rank {best_selfplay_rank:.3f} -> {best_ckpt.name}")
+        else:
+            print(f"  No improvement (best={best_selfplay_rank:.3f}); timestamped snapshot saved only")
+
+        # PFSP: update win_rate_table for every snapshot currently in the pool.
+        # win_rate_table maps str(snapshot_path) → win_rate in [0, 1].
+        # We evaluate each surviving snapshot with 30 episodes.  Snapshots we
+        # already pruned are automatically dropped since pool_ref was just refreshed.
+        # The updated table is shared by reference with all env factories, so the
+        # next episode reset in each worker will use the new PFSP weights.
+        if kept_snaps:
+            print(f"  PFSP: evaluating win rates against {len(kept_snaps)} pool snapshots ...")
+            # Remove stale entries for pruned snapshots.
+            live_keys = {str(s) for s in kept_snaps}
+            stale = [k for k in list(win_rate_table.keys()) if k not in live_keys]
+            for k in stale:
+                del win_rate_table[k]
+
+            pfsp_log_lines: list[str] = []
+            for snap in kept_snaps:
+                wr = _eval_win_rate_vs_snapshot(snap, n_episodes=30)
+                win_rate_table[str(snap)] = wr
+                pfsp_log_lines.append(f"{snap.name}: win_rate={wr:.2f}")
+
+            # Log a compact PFSP weight summary for TensorBoard / stdout diagnostics.
+            pfsp_weights = _compute_pfsp_weights(kept_snaps, win_rate_table)
+            for snap, w, line in zip(kept_snaps, pfsp_weights, pfsp_log_lines):
+                print(f"    {line} | pfsp_weight={w:.3f}")
+            try:
+                # Log scalar: mean loss_rate = 1 - mean win_rate over pool.
+                mean_win_rate = float(np.mean(list(win_rate_table.values())))
+                model.logger.record("self_play/pfsp_mean_win_rate", mean_win_rate)
+                model.logger.record("self_play/pfsp_mean_loss_rate", 1.0 - mean_win_rate)
+                model.logger.dump(step=model.num_timesteps)
+            except Exception:
+                pass  # logger may not be ready
 
     vec_env.close()
     return best_ckpt
@@ -865,6 +1206,7 @@ def _cli() -> None:
             init_from=args.init_from,
             device=args.device,
             log_dir=args.log_dir if args.log_dir != _ROOT / "logs" else None,
+            pool_size=args.pool_size,
         )
 
 

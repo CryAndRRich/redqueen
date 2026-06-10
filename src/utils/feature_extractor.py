@@ -47,7 +47,13 @@ ITEM_CAPACITY: int = 4
 # --------------------------------------------------------------------------- #
 
 def _blast_mask_single(grid: np.ndarray, bx: int, by: int, radius: int) -> np.ndarray:
-    """Return (H, W) bool mask of tiles reachable in blast from (bx, by)."""
+    """Return (H, W) bool mask of tiles reachable in blast from (bx, by).
+
+    Blast rules (matching engine/_get_explosion_tiles):
+      - WALL: blocks propagation; wall cell itself is NOT included.
+      - BOX:  blocks propagation; box cell IS included (it will be destroyed).
+      - Grid is indexed as grid[x, y] where x=row, y=col — same as engine.
+    """
     mask = np.zeros((H, W), dtype=np.bool_)
     mask[bx, by] = True
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
@@ -56,10 +62,10 @@ def _blast_mask_single(grid: np.ndarray, bx: int, by: int, radius: int) -> np.nd
             if not (0 <= x < H and 0 <= y < W):
                 break
             if grid[x, y] == WALL:
-                break
+                break          # wall not included; stops propagation
             mask[x, y] = True
             if grid[x, y] == BOX:
-                break
+                break          # box included (destroyed); stops propagation beyond
     return mask
 
 
@@ -92,10 +98,15 @@ def compute_blast_channels(
     n_players = len(players)
     for row in bombs_arr:
         bx, by, timer, owner_id = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+        # NOTE: the obs bombs array [x, y, timer, owner_id] does NOT include the
+        # bomb's radius (which is fixed at placement time). We approximate using
+        # the owner's CURRENT radius_bonus.  This is slightly inaccurate if the
+        # owner collected a radius item after placing the bomb, but it is the best
+        # estimate available from the obs schema.
         if 0 <= owner_id < n_players:
             radius = 1 + int(players[owner_id][4])
         else:
-            radius = 2  # fallback
+            radius = 2  # fallback for invalid/eliminated owner
         blast = _blast_mask_single(grid, bx, by, radius)
         danger_medium |= blast
         if timer <= 3:
@@ -123,15 +134,21 @@ def extract_features(
     """
     Convert raw BomberEnv obs to (spatial, aux) tensors.
 
+    Coordinate convention (matches engine):
+        grid[x, y]  where x = row (0..12), y = col (0..12)
+        Player.x = row, Player.y = col
+
     Args:
         obs:              dict with "map" (13,13), "players" (4,5), "bombs" (N,4)
         agent_id:         index of the controlled agent (0–3)
         step:             current game step for step_normalized
         total_steps:      max steps (500)
-        initial_boxes:    box count at game start (for normalization)
-        boxes_remaining:  live box count now; if None, counted from grid
-        my_kills:         externally tracked kill count
-        my_boxes_destroyed: externally tracked boxes-destroyed count
+        initial_boxes:    box count at game start — call count_boxes(obs["map"]) at
+                          reset() and pass the result here every step.
+                          Default 50 is a rough fallback only.
+        boxes_remaining:  live box count this step; if None, counted from grid.
+        my_kills:         externally tracked kill count (default 0 for BC training)
+        my_boxes_destroyed: externally tracked boxes-destroyed count (default 0)
 
     Returns:
         spatial: (N_SPATIAL, H, W) float32
@@ -180,8 +197,9 @@ def extract_features(
     if bombs_arr is not None and len(bombs_arr) > 0:
         for row in bombs_arr:
             bx, by, timer, owner_id = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+            # Normalize timer: timer==7 → 1.0, timer==1 → ~0.143, no bomb → 0.0
             t_norm = float(timer) / BOMB_TIMER_MAX
-            # max over overlapping bombs
+            # Keep the highest timer value when multiple bombs share a cell
             if t_norm > spatial[9, bx, by]:
                 spatial[9, bx, by] = t_norm
             if int(owner_id) == aid:
@@ -232,7 +250,17 @@ def extract_features_padded(
     agent_id: int,
     **kwargs,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Same as extract_features but pads bomb array to MAX_BOMBS for ONNX."""
+    """Same as extract_features.
+
+    Note on bomb padding: bombs are encoded INTO the spatial channels (Ch 9–11
+    and Ch 12–14) rather than passed as a raw tensor to ONNX.  The ONNX model
+    inputs are (spatial: 15×13×13, aux: 7) — there is no separate raw-bomb
+    input.  Therefore no padding to MAX_BOMBS=16 is needed here.
+
+    Bomb padding in export_onnx.py is NOT required for this architecture.
+    If the model interface ever changes to accept raw bomb tensors as a third
+    input, add the padding logic here.
+    """
     return extract_features(obs, agent_id, **kwargs)
 
 
