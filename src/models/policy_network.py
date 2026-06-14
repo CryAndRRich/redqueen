@@ -248,14 +248,19 @@ class BomberPolicyNet(nn.Module):
     def load_from_sb3(self, sb3_policy) -> None:
         """
         Copy weights from a trained SB3 MaskablePPO policy into this network.
-        Relies on matching sub-module names between BomberPolicyNet and
-        BomberCNNExtractor (spatial_enc, aux_enc, fusion).
+        Assumes net_arch=dict(pi=[256], vf=[256]) so mlp_extractor.policy_net[0]
+        is Linear(256→256) matching policy_head[0], and action_net is Linear(256→6)
+        matching policy_head[2].
         """
         fe = sb3_policy.features_extractor
+        pol = sb3_policy
         self.spatial_enc.load_state_dict(fe.spatial_enc.state_dict())
         self.aux_enc.load_state_dict(fe.aux_enc.state_dict())
-        # SB3 MultiInputPolicy stores fusion inside features_extractor
-        self.fusion[0].load_state_dict(fe.fusion[0].state_dict())
+        self.fusion.load_state_dict(fe.fusion.state_dict())
+        self.policy_head[0].load_state_dict(pol.mlp_extractor.policy_net[0].state_dict())
+        self.policy_head[2].load_state_dict(pol.action_net.state_dict())
+        self.value_head[0].load_state_dict(pol.mlp_extractor.value_net[0].state_dict())
+        self.value_head[2].load_state_dict(pol.value_net.state_dict())
 
     def init_from_bc(self, bc_path: str, device: str = "cpu") -> None:
         """Load BC weights from a tactical_bc.py checkpoint."""

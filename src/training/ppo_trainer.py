@@ -334,19 +334,14 @@ def _set_lr(model, lr: float) -> None:
 def _load_bc_into_sb3(model, bc_path: Path, device: str) -> None:
     """Transfer ALL BC-trained weights into SB3 MaskablePPO policy.
 
-    Full layer mapping (BomberPolicyNet → SB3 MaskablePPO):
-      spatial_enc          → features_extractor.spatial_enc
-      aux_enc              → features_extractor.aux_enc
-      fusion[0] (3168→256) → features_extractor.fusion[0]
-      fusion[2] (256→128)  → mlp_extractor.policy_net[0]
-                           → mlp_extractor.value_net[0]  (shared in BC, split in SB3)
-      policy_head (128→6)  → action_net
-      value_head  (128→1)  → value_net
-
-    Previously only the feature extractor (spatial_enc, aux_enc, fusion[0]) was loaded.
-    The BC-trained policy_head and value_head were silently discarded, causing PPO to
-    start with a randomly-initialized action head despite BC pre-training.  This was
-    the root cause of entropy instability and slow Stage 0→1 convergence.
+    Full layer mapping (BomberPolicyNet → SB3 MaskablePPO with net_arch=dict(pi=[256], vf=[256])):
+      spatial_enc             → features_extractor.spatial_enc
+      aux_enc                 → features_extractor.aux_enc
+      fusion (Linear 6304→256 + ReLU) → features_extractor.fusion
+      policy_head[0] (256→256) → mlp_extractor.policy_net[0]
+      value_head[0]  (256→256) → mlp_extractor.value_net[0]
+      policy_head[2] (256→6)   → action_net
+      value_head[2]  (256→1)   → value_net
     """
     import torch
     from src.models.policy_network import BomberPolicyNet
@@ -357,12 +352,13 @@ def _load_bc_into_sb3(model, bc_path: Path, device: str) -> None:
 
     fe.spatial_enc.load_state_dict(bc_net.spatial_enc.state_dict())
     fe.aux_enc.load_state_dict(bc_net.aux_enc.state_dict())
-    fe.fusion.load_state_dict(bc_net.fusion[:2].state_dict())
-    # BC fusion[2] is shared actor+critic; initialize both SB3 branches from it.
-    pol.mlp_extractor.policy_net[0].load_state_dict(bc_net.fusion[2].state_dict())
-    pol.mlp_extractor.value_net[0].load_state_dict(bc_net.fusion[2].state_dict())
-    pol.action_net.load_state_dict(bc_net.policy_head.state_dict())
-    pol.value_net.load_state_dict(bc_net.value_head.state_dict())
+    fe.fusion.load_state_dict(bc_net.fusion.state_dict())
+    # BC policy_head[0]/value_head[0] are the 256→256 hidden layers.
+    # Initialize both SB3 mlp_extractor branches from the corresponding BC head.
+    pol.mlp_extractor.policy_net[0].load_state_dict(bc_net.policy_head[0].state_dict())
+    pol.mlp_extractor.value_net[0].load_state_dict(bc_net.value_head[0].state_dict())
+    pol.action_net.load_state_dict(bc_net.policy_head[2].state_dict())
+    pol.value_net.load_state_dict(bc_net.value_head[2].state_dict())
     print(f"  Loaded BC weights (all layers) from {bc_path.name}")
 
 
@@ -717,7 +713,7 @@ def train_curriculum(
                 policy_kwargs={
                     "features_extractor_class": BomberCNNExtractor,
                     "features_extractor_kwargs": {"features_dim": 256},
-                    "net_arch": dict(pi=[128], vf=[128]),
+                    "net_arch": dict(pi=[256], vf=[256]),
                 },
                 verbose=1,
                 device=device,
@@ -1077,13 +1073,14 @@ def train_self_play(
 def _save_sb3_weights(model, path: Path) -> None:
     """Extract BomberPolicyNet-compatible weights from SB3 model and save.
 
-    Mapping (SB3 MultiInputPolicy → BomberPolicyNet):
-      features_extractor.spatial_enc  → spatial_enc
-      features_extractor.aux_enc      → aux_enc
-      features_extractor.fusion[0]    → fusion[0]  (Linear 3168→256)
-      mlp_extractor.policy_net[0]     → fusion[2]  (Linear 256→128)
-      action_net                       → policy_head (Linear 128→6)
-      value_net                        → value_head  (Linear 128→1)
+    Mapping (SB3 MultiInputPolicy with net_arch=dict(pi=[256],vf=[256]) → BomberPolicyNet):
+      features_extractor.spatial_enc     → spatial_enc
+      features_extractor.aux_enc         → aux_enc
+      features_extractor.fusion          → fusion  (Linear 6304→256 + ReLU)
+      mlp_extractor.policy_net[0]        → policy_head[0]  (Linear 256→256)
+      action_net                          → policy_head[2]  (Linear 256→6)
+      mlp_extractor.value_net[0]         → value_head[0]   (Linear 256→256)
+      value_net                           → value_head[2]   (Linear 256→1)
     """
     import torch
     from src.models.policy_network import BomberPolicyNet
@@ -1095,12 +1092,11 @@ def _save_sb3_weights(model, path: Path) -> None:
     try:
         net.spatial_enc.load_state_dict(fe.spatial_enc.state_dict())
         net.aux_enc.load_state_dict(fe.aux_enc.state_dict())
-        # fusion[0] = Linear(3168→256), fusion[1] = ReLU (no params)
-        net.fusion[0].load_state_dict(fe.fusion[0].state_dict())
-        # fusion[2] = Linear(256→128) comes from SB3 mlp_extractor.policy_net[0]
-        net.fusion[2].load_state_dict(pol.mlp_extractor.policy_net[0].state_dict())
-        net.policy_head.load_state_dict(pol.action_net.state_dict())
-        net.value_head.load_state_dict(pol.value_net.state_dict())
+        net.fusion.load_state_dict(fe.fusion.state_dict())
+        net.policy_head[0].load_state_dict(pol.mlp_extractor.policy_net[0].state_dict())
+        net.policy_head[2].load_state_dict(pol.action_net.state_dict())
+        net.value_head[0].load_state_dict(pol.mlp_extractor.value_net[0].state_dict())
+        net.value_head[2].load_state_dict(pol.value_net.state_dict())
     except Exception as e:
         print(f"  Warning: partial weight transfer ({e})")
 
@@ -1133,12 +1129,11 @@ def _restore_sb3_weights(model, checkpoint_path: Path, device: str) -> None:
     try:
         fe.spatial_enc.load_state_dict(net.spatial_enc.state_dict())
         fe.aux_enc.load_state_dict(net.aux_enc.state_dict())
-        fe.fusion[0].load_state_dict(net.fusion[0].state_dict())
-        # fusion[2] was saved from policy_net[0]; reinitialize both branches.
-        pol.mlp_extractor.policy_net[0].load_state_dict(net.fusion[2].state_dict())
-        pol.mlp_extractor.value_net[0].load_state_dict(net.fusion[2].state_dict())
-        pol.action_net.load_state_dict(net.policy_head.state_dict())
-        pol.value_net.load_state_dict(net.value_head.state_dict())
+        fe.fusion.load_state_dict(net.fusion.state_dict())
+        pol.mlp_extractor.policy_net[0].load_state_dict(net.policy_head[0].state_dict())
+        pol.mlp_extractor.value_net[0].load_state_dict(net.value_head[0].state_dict())
+        pol.action_net.load_state_dict(net.policy_head[2].state_dict())
+        pol.value_net.load_state_dict(net.value_head[2].state_dict())
         print(f"  Restored stage-best weights from {checkpoint_path.name}")
     except Exception as e:
         print(f"  Warning: partial weight restore ({e})")
