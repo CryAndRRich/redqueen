@@ -169,6 +169,17 @@ def generate_dataset(
         if winner_id is None:
             continue  # skip degenerate game
 
+        # Quality filter: require meaningful engagement from winner.
+        # Without this, passive winners (all enemies killed each other) pollute
+        # the dataset with STOP-heavy demonstrations that teach BC to avoid bombs —
+        # the primary cause of near-zero kill_credit observed in Stage 1 training.
+        winner_bomb_placements = sum(
+            1 for rec in history
+            if rec["alive_before"][winner_id] == 1 and rec["actions"][winner_id] == 5
+        )
+        if survival_steps[winner_id] < 120 or winner_bomb_placements < 5:
+            continue  # passive or early-lucky win — skip
+
         # Collect winner's transitions from history
         winner_demos = 0
         for record in history:
@@ -388,7 +399,8 @@ def train_tactical_bc(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    best_ckpt: Path = output_dir / "tactical_bc_best.pt"
+    ts_run = time.strftime("%Y%m%d_%H%M%S")
+    best_ckpt: Path = output_dir / f"tactical_bc_best_{ts_run}.pt"
 
     # ── Training loop ────────────────────────────────────────────────── #
     best_val_loss = float("inf")

@@ -14,15 +14,19 @@ Changes from v4:
     4 Manhattan tiles of the map centre (6, 6) AND ≥2 enemies are still alive.
     Capped to one bonus per step; irrelevant in 1v1 end-game.
   - IMPROVEMENT 4: Continuous own_blast_loiter penalty scaled by
-    (7 - timer) / 7 * 0.08, giving a smooth range [0.01, 0.08] instead of a
+    (7 - timer) / 7 * 0.25, giving a smooth range [0.04, 0.21] instead of a
     stepped multiplier.  Maximum at timer=1 (bomb about to explode),
-    minimum at timer=6.
+    minimum at timer=6.  At timer≤2 the penalty exceeds danger_enter (-0.15),
+    forcing the agent to flee own bombs even into enemy blast zones.
   - IMPROVEMENT 5: Wasted-bomb penalty (−0.05) when one of our bombs detonates
     (timer==1 or chain-triggered) and it destroyed 0 boxes AND 0 enemies died
     in this step.  Detected per-exploding-bomb; at most one penalty per step
     regardless of how many bombs expire.
   - All other v4 logic preserved verbatim (chain-reaction detection, BC
-    attribution, kill attribution, item contest, approach_enemy gating, etc.)
+    attribution, kill attribution, item contest, etc.)
+  - FIX (Stage 1 convergence): approach_enemy gate removed (_APPROACH_ENEMY_MIN_STEP=0).
+    Previously gated at step>300, but agent typically died at step 80-120 so kill
+    incentive was never active.  Now active from step 0 (still gated on bombs_left>0).
 """
 
 from __future__ import annotations
@@ -51,7 +55,7 @@ REWARDS: dict[str, float] = {
     # Danger shaping
     "danger_evasion":       0.15,
     "danger_enter":        -0.15,
-    "own_blast_loiter_max": 0.08,  # Improvement 4: max loiter penalty (timer==1)
+    "own_blast_loiter_max": 0.25,  # Improvement 4: max loiter penalty (timer==1) — exceeds danger_enter at timer≤2
     # Wasted bomb
     "wasted_bomb":         -0.05,  # Improvement 5: bomb explodes, 0 boxes + 0 kills
     # Movement
@@ -70,7 +74,7 @@ _DEFAULT_BOMB_TIMER: int = 7
 _LATE_GAME_RAMP_START: int = 350      # Improvement 1: ramp begins here
 _LATE_GAME_RAMP_END: int = 500        # Improvement 1: ramp reaches ×1.3 here
 _LATE_GAME_MAX_BONUS: float = 0.3     # Improvement 1: maximum additive bonus to multiplier
-_APPROACH_ENEMY_MIN_STEP: int = 300   # approach_enemy only active after this step
+_APPROACH_ENEMY_MIN_STEP: int = 0     # approach_enemy active from step 0 — early kill incentive required to escape local optimum
 _TOTAL_STEPS: int = 500               # max episode length
 _MAP_CENTRE: tuple[int, int] = (6, 6) # Improvement 3: zone control centre tile
 _ZONE_CONTROL_RADIUS: int = 4         # Improvement 3: Manhattan radius for zone control
@@ -435,8 +439,9 @@ def compute_reward(
             ))
             my_boxes_destroyed += destroyed
             # Improvement 5: track whether this bomb destroyed nothing and
-            # killed nobody — assessed after all kills are counted above.
-            if destroyed == 0 and len(newly_dead_enemies) == 0:
+            # killed nobody (attributed to me) — use `kills` not `newly_dead_enemies`
+            # to avoid false-negative when enemies died from other causes this step.
+            if destroyed == 0 and kills == 0:
                 wasted_bomb_fired = True
 
     if my_boxes_destroyed > 0:
@@ -451,7 +456,7 @@ def compute_reward(
     # Only penalise once per step even if multiple bombs expired with no effect.
     # We also skip the penalty if the bomb DID destroy boxes (handled above in
     # the per-bomb loop) or if enemies died this step (even if not attributed).
-    if wasted_bomb_fired and my_boxes_destroyed == 0 and len(newly_dead_enemies) == 0:
+    if wasted_bomb_fired and my_boxes_destroyed == 0 and kills == 0:
         reward += REWARDS["wasted_bomb"]
         info["wasted_bomb"] = float(REWARDS["wasted_bomb"])
 
@@ -460,16 +465,21 @@ def compute_reward(
     curr_radius_bonus = int(curr_p[aid][4])
     prev_cap = int(prev_p[aid][3])
     curr_cap = int(curr_p[aid][3])
-    # Capacity increase from item pickup (not from bomb use, which decreases cap)
-    if curr_radius_bonus > prev_radius_bonus or curr_cap > prev_cap:
+    px, py = int(prev_p[aid][0]), int(prev_p[aid][1])
+    cx, cy = int(curr_p[aid][0]), int(curr_p[aid][1])
+    # Radius items: radius_bonus only increases from item pickup — safe direct check.
+    # Capacity items: bombs_left ALSO increases when a bomb detonates (slot returned).
+    # Use tile check: the tile the agent moved to must have been code=4 (capacity item)
+    # in prev_obs to count. This distinguishes item pickup from bomb-return.
+    radius_item = curr_radius_bonus > prev_radius_bonus
+    cap_item = curr_cap > prev_cap and prev_grid[cx, cy] == 4
+    if radius_item or cap_item:
         item_r = REWARDS["item_collected"] * lm
         reward += item_r
         info["item_collected"] = item_r
         episode_stats["items_collected"] = episode_stats.get("items_collected", 0) + 1  # type: ignore[operator]
 
     # ── Item contest bonus ────────────────────────────────────────────── #
-    px, py = int(prev_p[aid][0]), int(prev_p[aid][1])
-    cx, cy = int(curr_p[aid][0]), int(curr_p[aid][1])
     if px != cx or py != cy:
         item_cells = np.argwhere(np.isin(np.asarray(curr_obs["map"], dtype=np.int32), [3, 4]))
         if len(item_cells) > 0:

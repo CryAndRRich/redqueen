@@ -63,7 +63,7 @@ PPO_DEFAULTS: dict = {
     "n_epochs":        10,
     "gamma":           0.995,
     "gae_lambda":      0.95,
-    "clip_range":      0.2,
+    "clip_range":      0.3,   # raised from 0.2: clip_fraction was 0.55-0.57 (saturated), larger range allows policy to escape plateau
     "ent_coef":        0.03,   # overridden at runtime by STAGE_ENT_COEF[stage_idx]; this default is never used
     "vf_coef":         0.5,
     "max_grad_norm":   0.5,
@@ -80,7 +80,7 @@ PPO_DEFAULTS: dict = {
 # Ref: Territory Paint Wars (arXiv:2604.04983) — large opponent jumps cause policy collapse.
 CURRICULUM_STAGES = [
     ("random",          0.8),   # Stage 0: must dominate randoms
-    ("simple",          1.2),   # Stage 1: must clearly beat simple
+    ("simple",          1.5),   # Stage 1: competitive vs simple (relaxed from 1.2 — 1.2 was unreachable with current architecture)
     ("simple_smarter1", 1.5),   # Stage 2 (BRIDGE): 1 Smarter + 2 Simple — smooth transition
     ("smarter",         1.8),   # Stage 3: 2 Smarter + 1 Simple anchor
     ("tactical",        2.0),   # Stage 4: 2 Tactical + 1 Smarter anchor
@@ -862,7 +862,7 @@ def train_self_play(
     """
     import warnings
     import torch
-    from stable_baselines3.common.vec_env import SubprocVecEnv
+    from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 
     warnings.filterwarnings("ignore", message=".*shared layers.*", category=UserWarning)
     MaskablePPO, _ = _make_maskable_ppo()
@@ -893,7 +893,14 @@ def train_self_play(
         )
         for i in range(n_envs)
     ]
-    vec_env = SubprocVecEnv(env_fns)
+    raw_vec_env = SubprocVecEnv(env_fns)
+    vec_env = VecNormalize(
+        raw_vec_env,
+        norm_obs=False,
+        norm_reward=True,
+        clip_reward=10.0,
+        gamma=PPO_DEFAULTS["gamma"],
+    )
 
     model = MaskablePPO(
         "MultiInputPolicy",
@@ -901,7 +908,7 @@ def train_self_play(
         policy_kwargs={
             "features_extractor_class": BomberCNNExtractor,
             "features_extractor_kwargs": {"features_dim": 256},
-            "net_arch": dict(pi=[128], vf=[128]),
+            "net_arch": dict(pi=[256], vf=[256]),
         },
         verbose=1,
         device=device,

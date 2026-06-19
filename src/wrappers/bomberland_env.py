@@ -87,6 +87,9 @@ class SingleAgentBomberEnv(gym.Env):
         self.episode_kills: int = 0
         self.episode_boxes: int = 0
         self.episode_items: int = 0
+        # Kill-assist blast history: persisted across steps so reward.py can
+        # credit partial kills from bombs that detonated in previous steps.
+        self._recent_bomb_blasts: list = []
         # Position history for multi-step stagnation detection.
         # Catches oscillation (A↔B) that single-step standing_still misses.
         self._pos_history: list[tuple[int, int]] = []
@@ -121,6 +124,7 @@ class SingleAgentBomberEnv(gym.Env):
         self.episode_kills = 0
         self.episode_boxes = 0
         self.episode_items = 0
+        self._recent_bomb_blasts = []
         self._pos_history = []
 
         # Re-init opponents to reset any internal state.
@@ -191,17 +195,20 @@ class SingleAgentBomberEnv(gym.Env):
         self.episode_boxes += my_boxes_this_step
 
         # Item collection: detect via players array stat increases (radius_bonus or
-        # bombs_left going up), consistent with reward.py detection logic.
-        # Map-cell disappearance is unreliable (simultaneous collection destroys the item
-        # without either agent collecting it).
+        # bombs_left going up). bombs_left ALSO increases when a bomb detonates (slot
+        # returned), so a tile check is required to distinguish capacity item from bomb
+        # return. radius_bonus only increases from items — safe direct check.
         aid = self._aid
         prev_radius_bonus = int(prev_p[aid][4])
         curr_radius_bonus = int(curr_p[aid][4])
         prev_cap = int(prev_p[aid][3])
         curr_cap = int(curr_p[aid][3])
-        # capacity can decrease when a bomb is placed; only count increases from pickup
         if int(curr_p[aid][2]) == 1:  # only if alive after step
-            if curr_radius_bonus > prev_radius_bonus or curr_cap > prev_cap:
+            cx_item = int(curr_p[aid][0])
+            cy_item = int(curr_p[aid][1])
+            radius_item = curr_radius_bonus > prev_radius_bonus
+            cap_item = curr_cap > prev_cap and prev_grid[cx_item, cy_item] == 4
+            if radius_item or cap_item:
                 self.episode_items += 1
 
         # Increment step BEFORE passing to compute_reward so current_step reflects
@@ -212,11 +219,14 @@ class SingleAgentBomberEnv(gym.Env):
             "kills": self.episode_kills,
             "boxes_destroyed": self.episode_boxes,
             "items_collected": self.episode_items,
+            "recent_bomb_blasts": self._recent_bomb_blasts,
         }
         reward, reward_info = compute_reward(
             self._raw_obs, next_raw, int(action), self._aid,
             episode_stats, self._step,
         )
+        # Persist kill-assist blast history updated by compute_reward across steps.
+        self._recent_bomb_blasts = episode_stats.get("recent_bomb_blasts", [])
 
         # Terminate when OUR agent dies, not just when the whole game ends.
         # The engine returns terminated=(alive_count<=1), which is False when our agent

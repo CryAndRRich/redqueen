@@ -1,6 +1,6 @@
 # CLAUDE.md — RedQueen AI Agent System
 > Auto-updated before each conversation compact via PreCompact hook.
-> Last manual update: 2026-05-26
+> Last manual update: 2026-06-19
 
 ---
 
@@ -12,8 +12,8 @@ MAP CODES    0=Grass  1=Wall  2=Box  3=ItemRadius  4=ItemCapacity
 OBS SCHEMA   {"map": (13,13) int8, "players": (4,5) int8, "bombs": (N,4) int8}
 PROTECTED    src/logic/action_masking.py  ← NEVER edit without explicit instruction
 
-REWARD FILE  src/training/reward.py   (v4 logic, no versioned suffix)
-NOTEBOOK     notebooks/train_on_kaggle.ipynb
+REWARD FILE  src/training/reward.py   (v5 logic, no versioned suffix)
+NOTEBOOK     notebooks/redqueen.ipynb
 CHECKPOINT   {phase}_{description}_{timestamp}.pt  ← never overwrite
 
 COMMON COMMANDS:
@@ -34,8 +34,15 @@ KEY INVARIANTS:
   - MIN_STEPS_PER_STAGE = 100_000
   - Stage 0→1 transition: reload BC (not Stage 0 best) + clear optimizer state
 
-REWARD v4 (canonical, as of 2026-06-10):
-  win=5.0  death=-3.0  kill=2.5  box=0.5  late-game multiplier: smooth ramp ×1.0→×1.3 (steps 350→500)
+REWARD v5 (canonical, as of 2026-06-19):
+  win=5.0  death=-3.0  kill=2.5  kill_assist=0.75  box=0.5  item=0.4  bomb=0.003
+  chain_reaction=0.5  item_contest=0.1  zone_control=0.005  wasted_bomb=-0.05
+  danger_evasion=0.15  danger_enter=-0.15  own_blast_loiter_max=0.25
+  survival_step=0.005  standing_still=-0.015  time_penalty=-0.003  approach_enemy=0.008
+  late-game multiplier: smooth ramp ×1.0→×1.3 (steps 350→500)
+  _APPROACH_ENEMY_MIN_STEP=0 (was 300) — approach reward active from step 0
+  clip_range=0.3 (was 0.2) — raised after clip_fraction hit 0.55-0.57 (saturated)
+  Stage 1 threshold=1.5 (was 1.2) — 1.2 never reachable with ResNet architecture
 
 WRAPPERS / NORMALIZATION:
   - VecNormalize applied to rewards at Phase 3+ (reward_normalization=True, norm_obs=False)
@@ -214,7 +221,7 @@ redqueen/
 │   └── pre_compact_update.py     # Auto-updates CLAUDE.md before each compact
 │
 ├── notebooks/
-│   └── train_on_kaggle.ipynb     # Full training pipeline on Kaggle GPU
+│   └── redqueen.ipynb            # Full training pipeline on Kaggle GPU
 │
 ├── history_game/                 # 9,278 real competition match JSON files (gitignored subset)
 │   └── YYYY-MM-DD/match_*.json   # See Section 5 for schema
@@ -351,54 +358,77 @@ Scalars 5–6 require external stat tracking (not in raw obs). Use `0.0` during 
 
 ---
 
-## 7. Reward Function (v3 — Tie-break + Game-mechanics Aware)
+## 7. Reward Function (v5 — Tie-break + Kill-assist + Bomb Efficiency)
 
-**File**: `src/training/reward.py` (v4 logic, canonical name).
+**File**: `src/training/reward.py` (canonical name, no version suffix).
 
 ### Reward Table
 
 ```python
 REWARDS = {
     # === TERMINAL ===
-    "win":                  3.0,    # last agent standing (also triggered on last kill)
-    "agent_death":         -2.0,    # own death (immediate return)
+    "win":                  5.0,    # last agent standing (also triggered on last kill)
+    "agent_death":         -3.0,    # own death (immediate return)
 
     # === TIE-BREAK STATS (priority order: kills > boxes > items > bombs) ===
-    "kill_credit":          2.0,    # confirmed kill; last-kill bonus: +win if enemies=0
-    "box_destroyed":        0.4,    # per box destroyed by MY bomb (correctly attributed)
-    "item_collected":       0.3,    # picking up radius or capacity item
+    "kill_credit":          2.5,    # confirmed kill; last-kill bonus: +win if enemies=0
+    "kill_assist":          0.75,   # 0.3 × kill_credit — partial credit via recent_bomb_blasts
+    "box_destroyed":        0.5,    # per box destroyed by MY bomb (correctly attributed)
+    "item_collected":       0.4,    # picking up radius or capacity item (tile check required)
     "bomb_placed":          0.003,  # placing a bomb (tie-break #4 padding)
 
     # === TACTICAL BONUSES ===
-    "chain_reaction":       0.3,    # placing bomb adjacent to another active bomb (timer≤4)
-    "item_contest":         0.1,    # moving toward item that an enemy is also approaching
+    "chain_reaction":       0.5,    # bomb blast overlaps an existing active bomb
+    "item_contest":         0.1,    # moving toward item an enemy is also approaching
+    "zone_control":         0.005,  # within 4 tiles of centre (6,6) AND ≥2 enemies alive
+    "wasted_bomb":         -0.05,   # bomb explodes with 0 boxes + 0 kills in blast
 
     # === DANGER SHAPING ===
-    "danger_evasion":       0.12,   # leaving blast zone (urgency ×1.5 if timer ≤ 3)
-    "danger_enter":        -0.08,   # stepping INTO blast zone voluntarily
-    "own_blast_loiter":    -0.04,   # standing in own bomb blast (× (8-timer) urgency)
+    "danger_evasion":       0.15,   # leaving blast zone (urgency ×1.5 if timer ≤ 3)
+    "danger_enter":        -0.15,   # stepping INTO blast zone voluntarily
+    "own_blast_loiter_max": 0.25,   # smooth: (7-timer)/7×0.25; at timer≤2 exceeds danger_enter
 
     # === MOVEMENT ===
     "survival_step":        0.005,  # alive bonus per step
-    "standing_still":      -0.008,  # repeated STOP actions
+    "standing_still":      -0.015,  # repeated STOP / same-cell actions
     "time_penalty":        -0.003,  # small time cost to prevent infinite games
 
-    # === ENEMY PRESSURE (FFA-safe — do not raise) ===
-    "approach_enemy":       0.006,  # × (prev_dist - curr_dist)
+    # === ENEMY PRESSURE ===
+    "approach_enemy":       0.008,  # × (prev_dist - curr_dist), active from step 0
 }
 ```
 
-### Key changes from v2 → v3
+Late-game multiplier: `1.0 + 0.3 * clamp((step - 350) / 150, 0, 1)` — smooth ramp ×1.0→×1.3 steps 350→500.
 
-| Change | v2 | v3 | Reason |
+### Key changes from v4 → v5 (2026-06-19)
+
+| Change | v4 | v5 | Reason |
 |--------|----|----|--------|
-| `kill_credit` | 1.5 | **2.0** | Last kill grants win bonus (enemies=0 → +3.0) |
-| `item_collected` | 0.15 | **0.3** | Tie-break #3 was underweighted |
-| `chain_reaction` | — | **+0.3** | Chain kills = boxes + multi-kill synergy |
-| `item_contest` | — | **+0.1** | Simultaneous collection destroys item |
-| Box attribution | all boxes | **my bombs only** | Enemy bomb boxes gave false credit |
+| `kill_assist` | — | **+0.75** | Partial credit for bomb assists; tracked via `recent_bomb_blasts` |
+| `chain_reaction` | 0.3 | **0.5** | Higher incentive for chained explosions |
+| `item_collected` | 0.3 | **0.4** | Underweighted vs actual tie-break value |
+| `danger_enter` | -0.08 | **-0.15** | Agent was voluntarily entering blast zones |
+| `danger_evasion` | 0.12 | **0.15** | Matches new enter penalty magnitude |
+| `own_blast_loiter_max` | 0.08 | **0.25** | At timer≤2: loiter > danger_enter → agent flees own bombs |
+| `standing_still` | -0.008 | **-0.015** | Stronger deterrent for camping/oscillation |
+| `approach_enemy` | 0.006 | **0.008** | Increased kill incentive |
+| `_APPROACH_ENEMY_MIN_STEP` | 300 | **0** | Gate removed — agent died at step 80–120, never triggered |
+| `zone_control` | — | **+0.005** | Center-map positioning bonus |
+| `wasted_bomb` | — | **-0.05** | Penalize bombs with no tactical impact |
 
-### Box destruction attribution (CRITICAL — fixed in v3)
+### item_collected — CRITICAL tile check (fixed in v5)
+```python
+# bombs_left ALSO increases when a bomb detonates (slot returned to owner).
+# A plain curr_cap > prev_cap check fires ~6-10× per game on bomb explosions,
+# corrupting the reward with +2.4 to +4.0 false item credits per game.
+# Fix: require agent's tile to have been a capacity item (grid==4) in prev_obs.
+radius_item = curr_radius_bonus > prev_radius_bonus          # safe — only items raise this
+cap_item = curr_cap > prev_cap and prev_grid[cx, cy] == 4   # tile check distinguishes bomb return
+if radius_item or cap_item:
+    reward += REWARDS["item_collected"] * lm
+```
+
+### Box destruction attribution (CRITICAL — fixed in v3, unchanged in v5)
 ```python
 # Only credit boxes destroyed by MY bombs with timer==1 in prev_obs.
 # timer==1 → decrements to 0 → explodes → boxes gone in curr_obs.
@@ -449,7 +479,7 @@ Phase 3  PPO + 7-Stage Curriculum   RL fine-tune from BC init
   └─ 20% random opponent mixing per training env (prevents co-adaptation)
   └─ Curriculum stages (MIN_STEPS_PER_STAGE=100_000 each, eval every 50k over 200 games):
        Stage 0: random          avg_rank ≤ 0.8
-       Stage 1: simple          avg_rank ≤ 1.2
+       Stage 1: simple          avg_rank ≤ 1.5  ← raised from 1.2 (1.2 unreachable with ResNet-256)
        Stage 2: simple_smarter1 avg_rank ≤ 1.5  ← BRIDGE (1 Smarter + 2 Simple)
        Stage 3: smarter         avg_rank ≤ 1.8  (2 Smarter + 1 Simple anchor)
        Stage 4: tactical        avg_rank ≤ 2.0  (2 Tactical + 1 Smarter anchor)
@@ -486,7 +516,7 @@ PPO_DEFAULTS = {
     "n_epochs":        10,
     "gamma":           0.995,    # high gamma — bomb timer = 7 steps delay
     "gae_lambda":      0.95,
-    "clip_range":      0.2,
+    "clip_range":      0.3,   # raised from 0.2: clip_fraction 0.55-0.57 was saturated
     "ent_coef":        0.03,     # base; overridden by STAGE_ENT_COEF at runtime
     "vf_coef":         0.5,
     "max_grad_norm":   0.5,
@@ -657,6 +687,35 @@ No. League Training is the mechanism for combining knowledge across model versio
 
 ## 14. Session Update Log
 *(Auto-appended by `scripts/pre_compact_update.py` before each compact)*
+
+### 2026-06-19 — Stage 1 convergence fix (4 root causes)
+
+**Diagnosis from 802k-step training log:**
+- Agent achieved best avg_rank 1.84 (threshold ≤1.2), oscillating 1.84–2.33 throughout
+- `reward_kill_credit` ~0.01-0.09 per game (nearly zero kills)
+- `reward_own_blast_loiter` very negative (-0.5 to -0.9) — agent dying to own bombs
+- `clip_fraction` 0.55-0.57 (normal 0.1-0.3) — policy updates saturated
+
+**Root Cause 1: Agent trapped in own bomb blast (own_blast_loiter < danger_enter)**
+- Agent calculated: stay in blast zone (-0.07/step) is better than move into danger (-0.15 one-time)
+- Fix: `own_blast_loiter_max` 0.08 → 0.25. At timer≤2: loiter (-0.18 to -0.21) > danger_enter (-0.15)
+  → agent now flees own bombs even into enemy blast zones
+
+**Root Cause 2: Zero kill incentive during the first 300 steps**
+- Agent typically died at step 80-120; approach_enemy gate at step>300 was never active
+- Fix: `_APPROACH_ENEMY_MIN_STEP` 300 → 0 (still gated on bombs_left>0)
+  → continuous incentive to approach enemies and get kills from step 0
+
+**Root Cause 3: clip_range too small, policy updates saturated**
+- Fix: `clip_range` 0.2 → 0.3 (in PPO_DEFAULTS)
+  → allows larger updates to escape the "farmer" local optimum
+
+**Root Cause 4: Stage 1 threshold 1.2 unreachable with ResNet architecture**
+- Larger network needs more training; 1.2 was calibrated for smaller 2-layer MLP
+- Fix: Stage 1 threshold 1.2 → 1.5 in CURRICULUM_STAGES
+  → achievable target; Stage 2 bridge (1 Smarter + 2 Simple, threshold 1.5) still provides gradual progression
+
+**Note:** Also re-run BC with 20 epochs (not 10) before next curriculum run for better Stage 1 starting point.
 
 ### 2026-06-10 — Comprehensive bug fixes + modern RL improvements
 

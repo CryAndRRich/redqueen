@@ -27,4 +27,5 @@
 
 ## Architecture Note
 
-`BomberPolicyNet.fusion = [Linear(3168→256), ReLU, Linear(256→128), ReLU]` — indices 0, 1, 2, 3.
+`BomberPolicyNet.fusion = [Linear(6304→256), ReLU]` — indices 0, 1 only (2 elements).
+spatial_enc output = 128×7×7 = 6272; aux_enc output = 32; fusion_in = 6272+32 = 6304.
