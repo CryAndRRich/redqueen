@@ -1,8 +1,3 @@
-"""
-Dynamic agent loader — load any Agent class from a .py file at runtime.
-Used by run_local_match.py and estimate_rankings.py.
-"""
-
 from __future__ import annotations
 
 import importlib.util
@@ -11,19 +6,6 @@ from pathlib import Path
 
 
 def load_agent_instance(agent_path: str, agent_id: int):
-    """
-    Dynamically load an Agent class from agent_path and instantiate it.
-
-    Adds the agent's parent directory to sys.path so helper modules
-    bundled alongside agent.py (e.g. model.onnx loader) can be imported.
-
-    Args:
-        agent_path: absolute or relative path to agent.py
-        agent_id:   player index to pass to Agent.__init__
-
-    Returns:
-        Instantiated agent object with .act(obs) method
-    """
     agent_dir = str(Path(agent_path).parent)
     if agent_dir not in sys.path:
         sys.path.insert(0, agent_dir)

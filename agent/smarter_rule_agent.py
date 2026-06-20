@@ -3,10 +3,6 @@ from collections import deque
 
 
 class SmarterRuleAgent:
-    """
-    Actions:
-    0: STOP, 1: LEFT, 2: RIGHT, 3: UP, 4: DOWN, 5: PLACE_BOMB
-    """
 
     MOVES = {
         0: (0, 0),
@@ -16,6 +12,7 @@ class SmarterRuleAgent:
         4: (0, 1),
     }
     team_id = "SmarterRuleAgent"
+
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
 
@@ -56,7 +53,6 @@ class SmarterRuleAgent:
         )
         box_spots = self._box_bomb_spots(grid, blocked)
 
-        # 1) Escape if in immediate danger
         if my_pos in danger_now or my_pos in danger_soon:
             escape = self._move_to_nearest_safe(
                 grid, my_pos, blocked, danger_soon, search_depth=8
@@ -66,13 +62,11 @@ class SmarterRuleAgent:
             safe_moves = [a for a in valid_actions if self._next_pos(my_pos, a) not in danger_now]
             return random.choice(safe_moves) if safe_moves else 0
 
-        # 2) Pick up items when reachable
         if item_tiles:
             move = self._move_toward_targets(grid, my_pos, item_tiles, blocked, danger_soon)
             if move is not None:
                 return move
 
-        # 3) Place bomb if tactical value exists and can likely escape
         if bombs_left > 0 and my_pos not in bomb_positions and self._can_hit_enemy_with_bomb(grid, my_pos, alive_enemies, bomb_radius):
             if self._can_escape_after_placing(grid, my_pos, blocked, danger_soon, bomb_radius):
                 return 5
@@ -81,19 +75,16 @@ class SmarterRuleAgent:
             if self._can_escape_after_placing(grid, my_pos, blocked, danger_soon, bomb_radius):
                 return 5
 
-        # 4) Move toward a good bombing tile for box farming
         if box_spots:
             move = self._move_toward_targets(grid, my_pos, box_spots, blocked, danger_soon)
             if move is not None:
                 return move
 
-        # 5) Move toward nearest enemy while avoiding danger
         if alive_enemies:
             move = self._move_toward_enemy(grid, my_pos, alive_enemies, blocked, danger_soon)
             if move is not None:
                 return move
 
-        # 6) Fallback safe random walk
         safe_moves = [a for a in valid_actions if self._next_pos(my_pos, a) not in danger_soon]
         return random.choice(safe_moves) if safe_moves else 0
 

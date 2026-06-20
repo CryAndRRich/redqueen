@@ -1,18 +1,7 @@
 {
-  "hooks": {
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /Users/luuvanson/Desktop/redqueen/scripts/pre_compact_update.py"
-          }
-        ]
-      }
-    ]
-  },
   "permissions": {
     "allow": [
+      "Bash(python3 /private/tmp/claude-501/-Users-luuvanson-Desktop-redqueen/20f9ece4-1238-4933-a6ac-0ad8d26041ca/scratchpad/gen_notebook.py)",
       "Bash(python3 -c ' *)"
     ]
   }

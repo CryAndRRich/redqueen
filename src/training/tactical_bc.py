@@ -1,18 +1,3 @@
-"""
-Tactical BC — replace history-game Behavioral Cloning with TacticalRuleAgent self-rollout BC.
-
-Two modes (select via CLI flags):
-  --generate  Run N full 4-player games of TacticalRuleAgent vs itself, collect winner
-              demonstrations, save to <data-dir>/tactical_bc_dataset.npz
-  --train     Train BomberPolicyNet (focal loss gamma=2) on the generated dataset,
-              save periodic + best checkpoints to checkpoints/
-
-Usage examples:
-  python -m src.training.tactical_bc --generate --n-games 200
-  python -m src.training.tactical_bc --train --epochs 20
-  python -m src.training.tactical_bc --generate --train --n-games 500 --epochs 30
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -27,38 +12,22 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 
-# ---------------------------------------------------------------------------
-# Path setup — allow running as both module and script
-# ---------------------------------------------------------------------------
 _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.logic.action_masking import compute_action_mask  # noqa: E402
-from src.models.policy_network import BomberPolicyNet  # noqa: E402
-from src.utils.feature_extractor import count_boxes, extract_features  # noqa: E402
+from src.logic.action_masking import compute_action_mask
+from src.models.policy_network import BomberPolicyNet
+from src.utils.feature_extractor import count_boxes, extract_features
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 N_AGENTS: int = 4
 N_ACTIONS: int = 6
 
 
-# ===========================================================================
-# Data generation — TacticalRuleAgent self-rollout
-# ===========================================================================
-
 def _determine_winner(ranks: list[int], survival_steps: list[int]) -> Optional[int]:
-    """
-    Return the agent index with rank == 0 (the winner).
-    If no agent achieved rank 0 (tie at step 500) return the agent with the
-    lowest rank; break ties by longest survival then lowest agent_id.
-    """
     for i, r in enumerate(ranks):
         if r == 0:
             return i
-    # Fallback: pick best-ranked survivor
     best_rank = min(ranks)
     candidates = [i for i, r in enumerate(ranks) if r == best_rank]
     candidates.sort(key=lambda i: (-survival_steps[i], i))
@@ -66,10 +35,6 @@ def _determine_winner(ranks: list[int], survival_steps: list[int]) -> Optional[i
 
 
 def _rank_players(players_list: list) -> list[int]:
-    """
-    Assign ranks [0..3] to each player from the engine Player objects.
-    Rank 0 = winner. Tie-break: kills > boxes > items > bombs > agent_id.
-    """
     n = len(players_list)
     order = sorted(
         range(n),
@@ -92,18 +57,8 @@ def generate_dataset(
     output_path: Path,
     seed: Optional[int] = None,
 ) -> None:
-    """
-    Run n_games of 4x TacticalRuleAgent, collect winner demonstrations,
-    and save the dataset to output_path as a .npz file.
-
-    Args:
-        n_games:     Number of full games to simulate.
-        output_path: Where to write the .npz dataset file.
-        seed:        Optional base RNG seed (each game gets seed+game_idx).
-    """
-    # Lazy import engine and agent — avoids hard dependency at module level
-    from agent.tactical_rule_agent import TacticalRuleAgent  # noqa: E402
-    from engine.game import BomberEnv  # noqa: E402
+    from agent.tactical_rule_agent import TacticalRuleAgent
+    from engine.game import BomberEnv
 
     rng_base = seed if seed is not None else int(time.time()) & 0xFFFFFF
 
@@ -121,10 +76,7 @@ def generate_dataset(
 
         agents = [TacticalRuleAgent(i) for i in range(N_AGENTS)]
 
-        # Per-game history buffer: (obs_before_action, action_taken) for each agent
-        # We only commit the winner's transitions after the game ends.
         history: list[dict] = []
-        # Track survival step for each agent
         survival_steps = [0] * N_AGENTS
         initial_boxes = count_boxes(obs["map"])
 
@@ -133,8 +85,6 @@ def generate_dataset(
         step = 0
 
         while not terminated and not truncated:
-            # Compute actions for all alive agents
-            actions_this_step: list[int] = []
             alive_flags = [int(obs["players"][i][2]) for i in range(N_AGENTS)]
             step_record: dict = {
                 "obs": obs,
@@ -148,7 +98,7 @@ def generate_dataset(
                     action = int(agents[i].act(obs))
                     survival_steps[i] = step
                 else:
-                    action = 0  # dead agent always STOP
+                    action = 0
                 agent_actions.append(action)
             step_record["actions"] = list(agent_actions)
             history.append(step_record)
@@ -156,36 +106,29 @@ def generate_dataset(
             obs, terminated, truncated = env.step(agent_actions)
             step += 1
 
-        # Final survival step update
         final_alive = [int(obs["players"][i][2]) for i in range(N_AGENTS)]
         for i in range(N_AGENTS):
             if final_alive[i] == 1:
                 survival_steps[i] = step
 
-        # Determine winner from engine Player stats
         ranks = _rank_players(env.players)
         winner_id = _determine_winner(ranks, survival_steps)
 
         if winner_id is None:
-            continue  # skip degenerate game
+            continue
 
-        # Quality filter: require meaningful engagement from winner.
-        # Without this, passive winners (all enemies killed each other) pollute
-        # the dataset with STOP-heavy demonstrations that teach BC to avoid bombs —
-        # the primary cause of near-zero kill_credit observed in Stage 1 training.
         winner_bomb_placements = sum(
             1 for rec in history
             if rec["alive_before"][winner_id] == 1 and rec["actions"][winner_id] == 5
         )
         if survival_steps[winner_id] < 120 or winner_bomb_placements < 5:
-            continue  # passive or early-lucky win — skip
+            continue
 
-        # Collect winner's transitions from history
         winner_demos = 0
         for record in history:
             agent_id = winner_id
             if record["alive_before"][agent_id] != 1:
-                continue  # agent was already dead this step
+                continue
 
             action_taken = record["actions"][agent_id]
             frame_obs = record["obs"]
@@ -204,7 +147,6 @@ def generate_dataset(
             )
             action_mask = compute_action_mask(frame_obs, agent_id)
 
-            # Skip transitions where the taken action is masked (safety guard)
             if not action_mask[action_taken]:
                 continue
 
@@ -222,10 +164,10 @@ def generate_dataset(
 
     print(f"Collected {total_demos:,} transitions from {n_games} games.")
 
-    spatial_arr = np.stack(all_spatial, axis=0).astype(np.float32)   # (N,15,13,13)
-    aux_arr = np.stack(all_aux, axis=0).astype(np.float32)           # (N,7)
-    actions_arr = np.array(all_actions, dtype=np.int64)              # (N,)
-    masks_arr = np.stack(all_masks, axis=0).astype(bool)             # (N,6)
+    spatial_arr = np.stack(all_spatial, axis=0).astype(np.float32)
+    aux_arr = np.stack(all_aux, axis=0).astype(np.float32)
+    actions_arr = np.array(all_actions, dtype=np.int64)
+    masks_arr = np.stack(all_masks, axis=0).astype(bool)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -238,18 +180,7 @@ def generate_dataset(
     print(f"Dataset saved to {output_path}  ({total_demos:,} samples, shape {spatial_arr.shape})")
 
 
-# ===========================================================================
-# Dataset — supports .npz only (spatial + aux + actions arrays)
-# ===========================================================================
-
 class TacticalBCDataset(Dataset):
-    """
-    In-memory dataset loaded from a .npz file produced by generate_dataset().
-
-    Keys expected: "spatial" (N,15,13,13) float32, "aux" (N,7) float32,
-                   "actions" (N,) int64, "action_masks" (N,6) bool.
-    """
-
     def __init__(self, npz_path: Path) -> None:
         data = np.load(str(npz_path), allow_pickle=False)
         self._spatial: np.ndarray = data["spatial"].astype(np.float32)
@@ -271,32 +202,12 @@ class TacticalBCDataset(Dataset):
         )
 
 
-# ===========================================================================
-# Focal Loss (handles class imbalance; PLACE_BOMB ~15% of actions)
-# ===========================================================================
-
 def masked_focal_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     masks: torch.Tensor,
     gamma: float = 2.0,
 ) -> torch.Tensor:
-    """
-    Focal loss with action masking.
-
-    Invalid action logits are filled with -1e9 before log-softmax so the policy
-    never learns to predict forbidden actions.  Samples whose target action is
-    itself masked are excluded from the loss (prevents catastrophic gradient spikes).
-
-    Args:
-        logits:  (B, 6) raw action logits
-        targets: (B,)   ground-truth action indices
-        masks:   (B, 6) bool mask — True means action is valid
-        gamma:   focal loss focusing parameter
-
-    Returns:
-        Scalar loss tensor.
-    """
     masked_logits = logits.masked_fill(~masks, -1e9)
     log_probs = torch.log_softmax(masked_logits, dim=1)
     log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
@@ -304,15 +215,10 @@ def masked_focal_loss(
     focal_weight = (1.0 - pt) ** gamma
     loss = -focal_weight * log_pt
 
-    # Guard: exclude samples where the target action is masked
     target_valid = masks.gather(1, targets.unsqueeze(1)).squeeze(1)
     valid_n = target_valid.float().sum().clamp(min=1.0)
     return (loss * target_valid.float()).sum() / valid_n
 
-
-# ===========================================================================
-# Training loop
-# ===========================================================================
 
 def train_tactical_bc(
     dataset_path: Path,
@@ -326,37 +232,11 @@ def train_tactical_bc(
     save_every: int = 5,
     init_from: Optional[Path] = None,
 ) -> Path:
-    """
-    Train BomberPolicyNet via Behavioral Cloning on TacticalRuleAgent rollouts.
-
-    Training structure:
-      - 90/10 train/val split with fixed seed 42
-      - Adam + CosineAnnealingLR over all epochs
-      - masked focal loss (gamma=2) per batch
-      - early stopping with patience=5 (no val_loss improvement)
-      - save every save_every epochs + save on new best val_loss
-
-    Args:
-        dataset_path: .npz file produced by generate_dataset()
-        output_dir:   directory for checkpoint files
-        epochs:       maximum training epochs
-        batch_size:   mini-batch size
-        lr:           Adam learning rate
-        val_split:    fraction held out for validation
-        gamma_focal:  focal loss gamma
-        device:       "cuda" / "cpu" / "auto"
-        save_every:   save checkpoint every N epochs
-        init_from:    optional warm-start checkpoint (.pt)
-
-    Returns:
-        Path to best checkpoint.
-    """
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     dev = torch.device(device)
     print(f"Device: {dev}")
 
-    # ── Dataset ──────────────────────────────────────────────────────── #
     full_dataset = TacticalBCDataset(dataset_path)
     n_total = len(full_dataset)
 
@@ -368,7 +248,7 @@ def train_tactical_bc(
         generator=torch.Generator().manual_seed(42),
     )
 
-    num_workers = min(4, 4)
+    num_workers = 4
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -386,7 +266,6 @@ def train_tactical_bc(
         persistent_workers=(num_workers > 0),
     )
 
-    # ── Model ────────────────────────────────────────────────────────── #
     model = BomberPolicyNet().to(dev)
     if init_from is not None and Path(init_from).exists():
         print(f"Warm-start from {init_from}")
@@ -402,7 +281,6 @@ def train_tactical_bc(
     ts_run = time.strftime("%Y%m%d_%H%M%S")
     best_ckpt: Path = output_dir / f"tactical_bc_best_{ts_run}.pt"
 
-    # ── Training loop ────────────────────────────────────────────────── #
     best_val_loss = float("inf")
     early_stop_patience = 5
     epochs_no_improve = 0
@@ -436,7 +314,6 @@ def train_tactical_bc(
         train_loss /= max(n_processed, 1)
         train_acc = train_correct / max(n_processed, 1)
 
-        # ── Validation ───────────────────────────────────────────────── #
         model.eval()
         val_loss = 0.0
         val_correct = 0
@@ -462,7 +339,6 @@ def train_tactical_bc(
             f"lr {scheduler.get_last_lr()[0]:.2e}"
         )
 
-        # ── Periodic checkpoint ───────────────────────────────────────── #
         if epoch % save_every == 0:
             ts = time.strftime("%Y%m%d_%H%M%S")
             ckpt_path = output_dir / f"tactical_bc_{epoch}ep_{ts}.pt"
@@ -477,7 +353,6 @@ def train_tactical_bc(
             )
             print(f"  -> Saved {ckpt_path.name}")
 
-        # ── Best checkpoint + early stopping ──────────────────────────── #
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -504,101 +379,23 @@ def train_tactical_bc(
     return best_ckpt
 
 
-# ===========================================================================
-# CLI
-# ===========================================================================
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Tactical BC — generate TacticalRuleAgent rollouts and/or train BomberPolicyNet"
     )
-    parser.add_argument(
-        "--generate",
-        action="store_true",
-        help="Run self-rollout games and save winner demonstrations to dataset",
-    )
-    parser.add_argument(
-        "--train",
-        action="store_true",
-        help="Train BomberPolicyNet on the dataset with focal loss",
-    )
-    parser.add_argument(
-        "--n-games",
-        type=int,
-        default=200,
-        metavar="N",
-        help="Number of games to generate (default: 200)",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=20,
-        metavar="N",
-        help="Number of training epochs (default: 20)",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=512,
-        metavar="N",
-        help="Mini-batch size (default: 512)",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=3e-4,
-        metavar="LR",
-        help="Adam learning rate (default: 3e-4)",
-    )
-    parser.add_argument(
-        "--gamma",
-        type=float,
-        default=2.0,
-        metavar="GAMMA",
-        help="Focal loss gamma parameter (default: 2.0)",
-    )
-    parser.add_argument(
-        "--save-every",
-        type=int,
-        default=5,
-        metavar="N",
-        help="Save checkpoint every N epochs (default: 5)",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help="Optional warm-start checkpoint (.pt) for training",
-    )
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=_ROOT / "data",
-        metavar="DIR",
-        help="Root data directory (default: <repo>/data)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=_ROOT / "checkpoints",
-        metavar="DIR",
-        help="Checkpoint output directory (default: <repo>/checkpoints)",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        choices=["auto", "cuda", "cpu"],
-        help="Training device (default: auto)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Base RNG seed for game generation (default: time-based)",
-    )
+    parser.add_argument("--generate", action="store_true")
+    parser.add_argument("--train", action="store_true")
+    parser.add_argument("--n-games", type=int, default=200, metavar="N")
+    parser.add_argument("--epochs", type=int, default=20, metavar="N")
+    parser.add_argument("--batch-size", type=int, default=512, metavar="N")
+    parser.add_argument("--lr", type=float, default=3e-4, metavar="LR")
+    parser.add_argument("--gamma", type=float, default=2.0, metavar="GAMMA")
+    parser.add_argument("--save-every", type=int, default=5, metavar="N")
+    parser.add_argument("--checkpoint", type=Path, default=None, metavar="PATH")
+    parser.add_argument("--data-dir", type=Path, default=_ROOT / "data", metavar="DIR")
+    parser.add_argument("--output-dir", type=Path, default=_ROOT / "checkpoints", metavar="DIR")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--seed", type=int, default=None, metavar="N")
     return parser
 
 

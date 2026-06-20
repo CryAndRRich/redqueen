@@ -1,13 +1,3 @@
-"""
-Estimate your agent's TrueSkill ranking by playing against random baselines.
-
-Usage:
-    pip install trueskill
-    python -m scripts.estimate_rankings --agent_path agent/agent.py --num_matches 100
-
-Output: win rate, average rank, TrueSkill score (mu - 3σ).
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -65,7 +55,6 @@ def estimate_rankings(agent_path: str, num_matches: int = 100, max_steps: int = 
         alive_final = [bool(obs["players"][j][2]) for j in range(4)]
         survivors = [j for j in range(4) if alive_final[j]]
 
-        # Ranks: 0 = best (survivor), increasing for earlier deaths
         ranks = [0] * 4
         current_rank = 1
         for j in reversed(death_order):

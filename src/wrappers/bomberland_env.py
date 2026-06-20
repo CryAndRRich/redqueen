@@ -1,22 +1,3 @@
-"""
-Single-agent Gymnasium wrapper around BomberEnv.
-
-Exposes a standard Gymnasium interface for one controlled agent (agent_id=0 by default)
-while internally stepping the other three agents using rule-based opponents.
-
-Supports sb3-contrib MaskablePPO via the action_masks() method.
-
-Usage:
-    from src.wrappers.bomberland_env import SingleAgentBomberEnv
-    from agent import GeniusRuleAgent
-
-    opponents = [GeniusRuleAgent(i) for i in range(1, 4)]
-    env = SingleAgentBomberEnv(opponents=opponents, agent_id=0, seed=42)
-    obs, info = env.reset()
-    obs, reward, terminated, truncated, info = env.step(3)
-    mask = env.action_masks()   # (6,) bool
-"""
-
 from __future__ import annotations
 
 import sys
@@ -27,32 +8,20 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# Project root on path so engine/ and agent/ are importable
 _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from engine import BomberEnv                                   # noqa: E402
-from src.utils.feature_extractor import (                      # noqa: E402
+from engine import BomberEnv
+from src.utils.feature_extractor import (
     extract_features, count_boxes, obs_to_dict,
 )
-from src.logic.action_masking import compute_action_mask       # noqa: E402
-from src.training.reward import compute_reward                  # noqa: E402
-from src.models.policy_network import make_observation_space   # noqa: E402
+from src.logic.action_masking import compute_action_mask
+from src.training.reward import compute_reward
+from src.models.policy_network import make_observation_space
 
 
 class SingleAgentBomberEnv(gym.Env):
-    """
-    Single-agent Gymnasium wrapper around BomberEnv (4-player FFA).
-
-    Args:
-        opponents:  list of 3 rule-based agent objects with .act(obs) method.
-                    They fill slots [1, 2, 3] (or 3 minus agent_id slots).
-        agent_id:   which player index we control (default 0).
-        max_steps:  game length (default 500).
-        seed:       base random seed.
-    """
-
     metadata: dict = {"render_modes": []}
 
     def __init__(
@@ -67,15 +36,13 @@ class SingleAgentBomberEnv(gym.Env):
         self._aid = int(agent_id)
         self._max_steps = max_steps
         self._base_seed = seed
-        self._opponents = opponents  # length 3, in order of OTHER player ids
+        self._opponents = opponents
 
         self.observation_space: spaces.Dict = make_observation_space()
         self.action_space: spaces.Discrete = spaces.Discrete(6)
 
-        # Internal engine instance
         self._engine = BomberEnv(max_steps=max_steps, seed=seed)
 
-        # Runtime state
         self._raw_obs: dict | None = None
         self._prev_obs: dict | None = None
         self._step: int = 0
@@ -83,25 +50,15 @@ class SingleAgentBomberEnv(gym.Env):
         self._my_kills: int = 0
         self._my_boxes: int = 0
         self._episode_seed: int = seed or 0
-        # Episode stats tracked per-step and exposed to compute_reward()
         self.episode_kills: int = 0
         self.episode_boxes: int = 0
         self.episode_items: int = 0
-        # Kill-assist blast history: persisted across steps so reward.py can
-        # credit partial kills from bombs that detonated in previous steps.
         self._recent_bomb_blasts: list = []
-        # Position history for multi-step stagnation detection.
-        # Catches oscillation (A↔B) that single-step standing_still misses.
         self._pos_history: list[tuple[int, int]] = []
 
-        # Build ordered list of [controlled_id, opp0_id, opp1_id, opp2_id]
         all_ids = list(range(4))
         all_ids.remove(self._aid)
-        self._opp_ids: list[int] = all_ids  # other 3 player ids in engine order
-
-    # ------------------------------------------------------------------ #
-    # Gymnasium interface                                                  #
-    # ------------------------------------------------------------------ #
+        self._opp_ids: list[int] = all_ids
 
     def reset(
         self,
@@ -112,7 +69,7 @@ class SingleAgentBomberEnv(gym.Env):
         if seed is not None:
             self._episode_seed = seed
         else:
-            self._episode_seed += 1  # different seed each episode
+            self._episode_seed += 1
 
         raw = self._engine.reset(seed=self._episode_seed)
         self._raw_obs = raw
@@ -127,9 +84,6 @@ class SingleAgentBomberEnv(gym.Env):
         self._recent_bomb_blasts = []
         self._pos_history = []
 
-        # Re-init opponents to reset any internal state.
-        # Call reset() for wrappers that track per-episode state (e.g. PastAgentWrapper);
-        # fall back to clearing escape_mode for legacy rule agents that don't expose reset().
         for opp in self._opponents:
             if hasattr(opp, "reset"):
                 opp.reset()
@@ -151,7 +105,6 @@ class SingleAgentBomberEnv(gym.Env):
 
         next_raw, engine_terminated, truncated = self._engine.step(actions)
 
-        # Track stats for aux features
         prev_p = np.asarray(self._raw_obs["players"])
         curr_p = np.asarray(next_raw["players"])
         prev_enemies = sum(int(prev_p[i][2]) for i in range(4) if i != self._aid)
@@ -160,9 +113,6 @@ class SingleAgentBomberEnv(gym.Env):
         self._my_kills += kills_this_step
         self.episode_kills += kills_this_step
 
-        # Box destruction: only credit boxes destroyed by MY bombs (timer==1 in prev_obs).
-        # Counting all map box disappearances would attribute enemy bomb hits to us,
-        # inflating the aux feature and causing mismatched reward signals.
         prev_p_arr = np.asarray(self._raw_obs["players"], dtype=np.int32)
         prev_grid = np.asarray(self._raw_obs["map"], dtype=np.int32)
         curr_grid = np.asarray(next_raw["map"], dtype=np.int32)
@@ -174,9 +124,8 @@ class SingleAgentBomberEnv(gym.Env):
                 for row in prev_bombs_arr:
                     bx, by, timer, owner = int(row[0]), int(row[1]), int(row[2]), int(row[3])
                     if owner != self._aid or timer != 1:
-                        continue  # only my bombs exploding this step
+                        continue
                     radius = 1 + int(prev_p_arr[self._aid][4])
-                    # Vectorized blast expansion along 4 axes, blocked by walls/boxes
                     blast = np.zeros((13, 13), dtype=np.bool_)
                     blast[bx, by] = True
                     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -184,26 +133,22 @@ class SingleAgentBomberEnv(gym.Env):
                             nx, ny = bx + dx * r, by + dy * r
                             if nx < 0 or nx >= 13 or ny < 0 or ny >= 13:
                                 break
-                            if prev_grid[nx, ny] == 1:  # wall blocks
+                            if prev_grid[nx, ny] == 1:
                                 break
                             blast[nx, ny] = True
-                            if prev_grid[nx, ny] == 2:  # box blocks further
+                            if prev_grid[nx, ny] == 2:
                                 break
                     destroyed = int(np.sum((prev_grid == 2) & (curr_grid != 2) & blast))
                     my_boxes_this_step += destroyed
         self._my_boxes += my_boxes_this_step
         self.episode_boxes += my_boxes_this_step
 
-        # Item collection: detect via players array stat increases (radius_bonus or
-        # bombs_left going up). bombs_left ALSO increases when a bomb detonates (slot
-        # returned), so a tile check is required to distinguish capacity item from bomb
-        # return. radius_bonus only increases from items — safe direct check.
         aid = self._aid
         prev_radius_bonus = int(prev_p[aid][4])
         curr_radius_bonus = int(curr_p[aid][4])
         prev_cap = int(prev_p[aid][3])
         curr_cap = int(curr_p[aid][3])
-        if int(curr_p[aid][2]) == 1:  # only if alive after step
+        if int(curr_p[aid][2]) == 1:
             cx_item = int(curr_p[aid][0])
             cy_item = int(curr_p[aid][1])
             radius_item = curr_radius_bonus > prev_radius_bonus
@@ -211,8 +156,6 @@ class SingleAgentBomberEnv(gym.Env):
             if radius_item or cap_item:
                 self.episode_items += 1
 
-        # Increment step BEFORE passing to compute_reward so current_step reflects
-        # the step that just completed (1-indexed), matching late-game threshold math.
         self._step += 1
 
         episode_stats = {
@@ -225,19 +168,11 @@ class SingleAgentBomberEnv(gym.Env):
             self._raw_obs, next_raw, int(action), self._aid,
             episode_stats, self._step,
         )
-        # Persist kill-assist blast history updated by compute_reward across steps.
         self._recent_bomb_blasts = episode_stats.get("recent_bomb_blasts", [])
 
-        # Terminate when OUR agent dies, not just when the whole game ends.
-        # The engine returns terminated=(alive_count<=1), which is False when our agent
-        # dies but 2+ enemies remain — causing hundreds of useless "dead" steps that
-        # flood the rollout buffer with STOP-only transitions and dilute training.
         our_alive = int(curr_p[self._aid][2]) == 1
         terminated = engine_terminated or (not our_alive)
 
-        # Multi-step stagnation penalty: catches camping / oscillation (A↔B).
-        # Fires when agent occupied the same cell 6+ times in last 8 steps.
-        # Complements reward standing_still (which only sees 1-step position change).
         my_pos = (int(curr_p[self._aid][0]), int(curr_p[self._aid][1]))
         self._pos_history.append(my_pos)
         if len(self._pos_history) > 8:
@@ -247,7 +182,7 @@ class SingleAgentBomberEnv(gym.Env):
             for pos in self._pos_history:
                 freq[pos] = freq.get(pos, 0) + 1
             if max(freq.values()) >= 6:
-                reward -= 0.03  # ~4× standing_still rate; discourages camping/oscillation
+                reward -= 0.03
 
         self._prev_obs = self._raw_obs
         self._raw_obs = next_raw
@@ -264,14 +199,9 @@ class SingleAgentBomberEnv(gym.Env):
         return obs_dict, reward, terminated, truncated, info
 
     def action_masks(self) -> np.ndarray:
-        """Return (6,) bool mask for MaskablePPO. True = valid action."""
         if self._raw_obs is None:
             return np.ones(6, dtype=np.bool_)
         return compute_action_mask(self._raw_obs, self._aid)
-
-    # ------------------------------------------------------------------ #
-    # Internal helpers                                                     #
-    # ------------------------------------------------------------------ #
 
     def _build_obs(self) -> dict[str, np.ndarray]:
         boxes_now = int((np.asarray(self._raw_obs["map"]) == 2).sum())
@@ -287,18 +217,12 @@ class SingleAgentBomberEnv(gym.Env):
         )
         return {"spatial": spatial, "aux": aux}
 
-    # ------------------------------------------------------------------ #
-    # Convenience                                                          #
-    # ------------------------------------------------------------------ #
-
     @property
     def current_step(self) -> int:
-        """Current episode step count (alias for _step)."""
         return self._step
 
     @property
     def raw_obs(self) -> dict | None:
-        """Access underlying engine obs (useful for rule-based fallback)."""
         return self._raw_obs
 
     def render(self) -> None:

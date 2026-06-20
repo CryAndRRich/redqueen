@@ -3,15 +3,6 @@ from collections import deque
 
 
 class GeniusRuleAgent:
-    """
-    Actions:
-    0: STOP
-    1: LEFT
-    2: RIGHT
-    3: UP
-    4: DOWN
-    5: PLACE_BOMB
-    """
 
     MOVES = {
         0: (0, 0),
@@ -21,11 +12,10 @@ class GeniusRuleAgent:
         4: (0, 1),
     }
     team_id = "GeniusRuleAgent"
+
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
         self.escape_mode = False
-
-    ############################################################
 
     def act(self, obs):
 
@@ -55,10 +45,6 @@ class GeniusRuleAgent:
 
         valid_actions = self._valid_actions(grid, my_pos, blocked)
 
-        ########################################################
-        # ESCAPE MODE
-        ########################################################
-
         if self.escape_mode or my_pos in danger_soon:
 
             escape = self._move_to_nearest_safe(
@@ -70,10 +56,6 @@ class GeniusRuleAgent:
                     self.escape_mode = False
                 return escape
 
-        ########################################################
-        # ITEM COLLECTION
-        ########################################################
-
         item_tiles = self._item_tiles(grid)
 
         if item_tiles:
@@ -84,10 +66,6 @@ class GeniusRuleAgent:
 
             if move is not None:
                 return move
-
-        ########################################################
-        # BOMB ENEMY
-        ########################################################
 
         if bombs_left > 0 and my_pos not in bomb_positions:
 
@@ -107,10 +85,6 @@ class GeniusRuleAgent:
                 if escape is not None:
                     self.escape_mode = True
                     return 5
-
-        ########################################################
-        # FARM BOXES
-        ########################################################
 
         if bombs_left > 0 and my_pos not in bomb_positions:
 
@@ -133,10 +107,6 @@ class GeniusRuleAgent:
                     self.escape_mode = True
                     return 5
 
-        ########################################################
-        # MOVE TO BOX SPOTS
-        ########################################################
-
         box_spots = self._box_bomb_spots(grid, blocked)
 
         if box_spots:
@@ -148,10 +118,6 @@ class GeniusRuleAgent:
             if move is not None:
                 return move
 
-        ########################################################
-        # ENEMY PRESSURE
-        ########################################################
-
         if enemies:
 
             move = self._move_toward_targets(
@@ -161,20 +127,12 @@ class GeniusRuleAgent:
             if move is not None:
                 return move
 
-        ########################################################
-        # RANDOM SAFE MOVE
-        ########################################################
-
         safe_moves = [
             a for a in valid_actions
             if self._next_pos(my_pos, a) not in danger_soon
         ]
 
         return random.choice(safe_moves) if safe_moves else 0
-
-    ############################################################
-    # BASIC HELPERS
-    ############################################################
 
     def _next_pos(self, pos, action):
         dx, dy = self.MOVES[action]
@@ -198,10 +156,6 @@ class GeniusRuleAgent:
                 actions.append(a)
 
         return actions
-
-    ############################################################
-    # DANGER MODEL
-    ############################################################
 
     def _blast_tiles(self, grid, bx, by, radius):
 
@@ -257,10 +211,6 @@ class GeniusRuleAgent:
 
         return danger_soon, danger_now
 
-    ############################################################
-    # BFS ESCAPE
-    ############################################################
-
     def _move_to_nearest_safe(self, grid, start, blocked, danger, search_depth=8):
 
         q = deque([(start, 0, None)])
@@ -299,10 +249,6 @@ class GeniusRuleAgent:
 
         return None
 
-    ############################################################
-    # PATHFINDING
-    ############################################################
-
     def _move_toward_targets(self, grid, start, targets, blocked, danger):
 
         q = deque([(start, None)])
@@ -338,10 +284,6 @@ class GeniusRuleAgent:
                 q.append((npos, a if first_action is None else first_action))
 
         return None
-
-    ############################################################
-    # STRATEGY HELPERS
-    ############################################################
 
     def _count_boxes_in_blast(self, grid, pos, radius):
 

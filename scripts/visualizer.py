@@ -1,15 +1,3 @@
-"""
-PyGame visualizer — watch agents play in real-time.
-
-Controls:
-    SPACE     — pause / resume
-    A / D     — previous / next step
-    W / S     — previous / next episode
-    ESC       — quit
-
-Requires: pip install pygame
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -28,10 +16,6 @@ from engine import BomberEnv
 from agent import RandomAgent, SimpleRuleAgent, SmarterRuleAgent, TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent
 from scripts.agent_loader import load_agent_instance
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Viewer (pygame)                                                              #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class Viewer:
     PLAYER_COLORS = [(220, 50, 50), (50, 50, 220), (30, 150, 30), (200, 140, 0)]
@@ -184,10 +168,6 @@ def _explosion_tiles(prev_obs: dict | None, obs: dict) -> set:
                     break
     return tiles
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Agent factory (shared with run_local_match)                                  #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 _BASELINE_MAP = {
     "randomagent":       lambda i: (RandomAgent(i),      "RandomAgent"),

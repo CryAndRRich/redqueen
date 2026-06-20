@@ -3,12 +3,6 @@ from collections import deque
 
 
 class TacticalRuleAgent:
-    """
-    Higher-complexity tactical agent:
-    - danger-aware navigation,
-    - adaptive objective priorities (item > box farm > pressure enemy),
-    - bombing only with value and escape.
-    """
 
     MOVES = {
         0: (0, 0),
@@ -18,6 +12,7 @@ class TacticalRuleAgent:
         4: (0, 1),
     }
     team_id = "TacticalRuleAgent"
+
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
 
@@ -75,7 +70,7 @@ class TacticalRuleAgent:
             can_hit_enemy = self._can_bomb_hit_enemy(grid, my_pos, enemies, bomb_radius)
             boxes_hit = self._count_boxes_in_blast(grid, my_pos, bomb_radius)
             if (can_hit_enemy or boxes_hit >= 1) and self._can_escape_after_placing(
-                grid, my_pos, blocked, danger_soon, bomb_radius # danger soon
+                grid, my_pos, blocked, danger_soon, bomb_radius
             ):
                 return 5
 
@@ -152,10 +147,6 @@ class TacticalRuleAgent:
         return cnt
 
     def _safe_tiles(self, grid, danger_soon):
-        """
-        Return all tiles that are safe to move to.
-        A tile is safe to move to if it is not in danger_soon.
-        """
         return {
             (x, y)
             for x in range(grid.shape[0])
@@ -168,7 +159,6 @@ class TacticalRuleAgent:
         best_score = -10**9
         for a in self._valid_actions(grid, my_pos, occupied):
             if a == 0:
-                # Timer may be >1: my_pos is in danger_soon but not danger_now — stay must not win.
                 continue
             npos = self._next_pos(my_pos, a)
             if npos in danger_now:

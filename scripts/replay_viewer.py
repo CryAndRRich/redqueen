@@ -1,19 +1,3 @@
-"""
-Replay viewer — replay a saved match JSON file with pygame.
-
-Usage:
-    python -m scripts.replay_viewer history_game/2026-05-23/match_xxx.json
-    python -m scripts.replay_viewer history_game/2026-05-23/match_xxx.json --fps 4 --paused
-
-Controls:
-    SPACE  — pause / resume
-    A / D  — previous / next step
-    Q / E  — jump to first / last step
-    ESC    — quit
-
-Requires: pip install pygame pillow
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -31,10 +15,6 @@ from PIL import Image, ImageDraw, ImageFont
 
 pygame = importlib.import_module("pygame")
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# Frame renderer (PIL-based — no pygame dependency at render time)             #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 _TOP_BAR = 48
 _RIGHT_PANEL = 280
@@ -99,11 +79,9 @@ def render_frame(obs: dict, prev_obs: dict | None = None, agent_names: list[str]
     except Exception:
         fn = fs = ImageFont.load_default()
 
-    # Top bar
     draw.rectangle([0, 0, total_w, _TOP_BAR], fill=(30, 30, 30, 255))
     draw.text((10, 14), f"Step {obs.get('_step', '?')}", fill=(245, 245, 245, 255), font=fn)
 
-    # Board background
     draw.rectangle([0, _TOP_BAR, board_w, total_h], fill=(144, 238, 144, 255))
 
     _COLORS = {0: (144, 238, 144), 1: (80, 80, 80), 2: (139, 69, 19), 3: (255, 200, 200), 4: (200, 200, 255)}
@@ -122,12 +100,10 @@ def render_frame(obs: dict, prev_obs: dict | None = None, agent_names: list[str]
                 label = "R" if ct == 3 else "C"
                 draw.text((x0 + 14, y0 + 12), label, fill=(80, 80, 80, 255), font=fn)
 
-    # Explosions
     for row, col in _explosion_tiles(prev_obs, obs):
         x0, y0 = col * _CELL, row * _CELL + _TOP_BAR
         draw.rectangle([x0, y0, x0 + _CELL, y0 + _CELL], fill=(255, 140, 0, 140))
 
-    # Bombs
     for b in bombs:
         bx, by, timer = int(b[0]), int(b[1]), int(b[2])
         cx = by * _CELL + _CELL // 2
@@ -136,7 +112,6 @@ def render_frame(obs: dict, prev_obs: dict | None = None, agent_names: list[str]
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(20, 20, 20, 255))
         draw.text((cx - 4, cy - 7), str(timer), fill=(255, 255, 255, 255), font=fs)
 
-    # Players
     for i, p in enumerate(players):
         if int(p[2]) != 1:
             continue
@@ -147,7 +122,6 @@ def render_frame(obs: dict, prev_obs: dict | None = None, agent_names: list[str]
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=_PLAYER_COLORS[i % 4])
         draw.text((cx - 4, cy - 7), str(i), fill=(255, 255, 255, 255), font=fn)
 
-    # Right panel
     px0 = board_w
     draw.rectangle([px0, 0, total_w, total_h], fill=(52, 58, 64, 255))
     draw.line([px0, 0, px0, total_h], fill=(20, 20, 20, 255), width=2)
@@ -168,10 +142,6 @@ def render_frame(obs: dict, prev_obs: dict | None = None, agent_names: list[str]
 
     return img
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# ReplayViewer (pygame window)                                                 #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class ReplayViewer:
     def __init__(self, history: list[dict], meta: dict | None = None, title: str = "Bomberland Replay", fps: int = 8):
@@ -255,10 +225,6 @@ class ReplayViewer:
 
         pygame.quit()
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# CLI                                                                          #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def load_history(json_path: str) -> tuple[list, dict]:
     with open(json_path) as f:

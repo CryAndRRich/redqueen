@@ -1,20 +1,3 @@
-"""
-RedQueen submission agent — ONNX Runtime inference, CPU-only.
-
-Self-contained: all feature extraction and action masking logic is inlined
-so the file can be submitted with just model.onnx and requirements.txt.
-
-Required files in same directory (zip root):
-    agent.py        ← this file
-    model.onnx      ← primary ONNX inference
-    model.pt        ← TorchScript fallback (if onnxruntime unavailable)
-
-Public interface (competition standard):
-    class Agent:
-        def __init__(self, agent_id: int)
-        def act(self, obs: dict) -> int
-"""
-
 from __future__ import annotations
 
 from collections import deque
@@ -29,10 +12,6 @@ try:
 except ImportError:
     _HAS_ORT = False
 
-# ═══════════════════════════════════════════════════════════════════════════ #
-#  INLINED CONSTANTS                                                           #
-# ═══════════════════════════════════════════════════════════════════════════ #
-
 _H = _W = 13
 _GRASS, _WALL, _BOX = 0, 1, 2
 _ITEM_RADIUS, _ITEM_CAP = 3, 4
@@ -43,10 +22,6 @@ _MAX_RADIUS_BONUS = 4
 _STOP, _LEFT, _RIGHT, _UP, _DOWN, _PLACE_BOMB = 0, 1, 2, 3, 4, 5
 _MOVES = {_LEFT: (-1, 0), _RIGHT: (1, 0), _UP: (0, -1), _DOWN: (0, 1)}
 
-
-# ═══════════════════════════════════════════════════════════════════════════ #
-#  INLINED BLAST / DANGER COMPUTATION (vectorized)                            #
-# ═══════════════════════════════════════════════════════════════════════════ #
 
 def _blast_mask_single(grid: np.ndarray, bx: int, by: int, radius: int) -> np.ndarray:
     mask = np.zeros((_H, _W), dtype=np.bool_)
@@ -85,10 +60,6 @@ def _compute_danger_channels(
     return now, soon, med
 
 
-# ═══════════════════════════════════════════════════════════════════════════ #
-#  INLINED FEATURE EXTRACTOR                                                  #
-# ═══════════════════════════════════════════════════════════════════════════ #
-
 def _extract(
     obs: dict,
     agent_id: int,
@@ -99,7 +70,6 @@ def _extract(
     my_kills: int = 0,
     my_boxes_destroyed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (spatial (15,13,13), aux (7,)) float32."""
     grid    = np.asarray(obs["map"], dtype=np.int8)
     players = np.asarray(obs["players"], dtype=np.float32)
     bombs_raw = obs["bombs"]
@@ -111,16 +81,13 @@ def _extract(
     aid = int(agent_id)
     sp  = np.zeros((15, _H, _W), dtype=np.float32)
 
-    # Channels 0–4: map one-hot
     for ch, v in enumerate([_GRASS, _WALL, _BOX, _ITEM_RADIUS, _ITEM_CAP]):
         sp[ch] = (grid == v)
 
-    # Channel 5: my position
     my = players[aid]
     if int(my[2]) == 1:
         sp[5, int(my[0]), int(my[1])] = 1.0
 
-    # Channels 6–8: enemy positions sorted by Manhattan distance
     enemies = [(i, players[i]) for i in range(len(players))
                if i != aid and int(players[i][2]) == 1]
     if int(my[2]) == 1 and enemies:
@@ -129,7 +96,6 @@ def _extract(
     for slot, (_, ep) in enumerate(enemies[:3]):
         sp[6 + slot, int(ep[0]), int(ep[1])] = 1.0
 
-    # Channels 9–11: bomb timer / ownership
     if bombs_arr is not None:
         for row in bombs_arr:
             bx, by, timer, oid = int(row[0]), int(row[1]), int(row[2]), int(row[3])
@@ -141,11 +107,11 @@ def _extract(
             else:
                 sp[11, bx, by] = 1.0
 
-    # Channels 12–14: danger maps
     dnow, dsoon, dmed = _compute_danger_channels(grid, bombs_arr, players)
-    sp[12] = dnow;  sp[13] = dsoon;  sp[14] = dmed
+    sp[12] = dnow
+    sp[13] = dsoon
+    sp[14] = dmed
 
-    # Aux scalars
     if boxes_remaining is None:
         boxes_remaining = int((grid == _BOX).sum())
     enemies_alive = float(sum(int(players[i][2]) for i in range(len(players)) if i != aid)) / 3.0
@@ -162,10 +128,6 @@ def _extract(
     return sp, aux
 
 
-# ═══════════════════════════════════════════════════════════════════════════ #
-#  INLINED ACTION MASKING                                                      #
-# ═══════════════════════════════════════════════════════════════════════════ #
-
 def _passable(grid: np.ndarray, x: int, y: int, bomb_set: frozenset) -> bool:
     if not (0 <= x < _H and 0 <= y < _W):
         return False
@@ -177,10 +139,13 @@ def _blast_set(grid: np.ndarray, bx: int, by: int, radius: int) -> set:
     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
         for r in range(1, radius + 1):
             x, y = bx + dx * r, by + dy * r
-            if not (0 <= x < _H and 0 <= y < _W): break
-            if grid[x, y] == _WALL: break
+            if not (0 <= x < _H and 0 <= y < _W):
+                break
+            if grid[x, y] == _WALL:
+                break
             tiles.add((x, y))
-            if grid[x, y] == _BOX: break
+            if grid[x, y] == _BOX:
+                break
     return tiles
 
 
@@ -216,12 +181,13 @@ def _compute_mask(obs: dict, agent_id: int) -> np.ndarray:
 
     aid = int(agent_id)
     if int(players[aid][2]) == 0:
-        mask[:] = False; mask[_STOP] = True
+        mask[:] = False
+        mask[_STOP] = True
         return mask
 
-    my_x, my_y     = int(players[aid][0]), int(players[aid][1])
-    bombs_left      = int(players[aid][3])
-    my_radius       = 1 + int(players[aid][4])
+    my_x, my_y = int(players[aid][0]), int(players[aid][1])
+    bombs_left  = int(players[aid][3])
+    my_radius   = 1 + int(players[aid][4])
 
     bombs_arr = (np.asarray(bombs_raw)
                  if (bombs_raw is not None and len(bombs_raw) > 0) else None)
@@ -256,16 +222,7 @@ def _compute_mask(obs: dict, agent_id: int) -> np.ndarray:
     return mask
 
 
-# ═══════════════════════════════════════════════════════════════════════════ #
-#  AGENT CLASS                                                                 #
-# ═══════════════════════════════════════════════════════════════════════════ #
-
 class Agent:
-    """
-    RedQueen ONNX submission agent.
-    Loads model.onnx from the same directory as this file.
-    """
-
     def __init__(self, agent_id: int) -> None:
         self.agent_id = int(agent_id)
         _dir = Path(__file__).parent
@@ -290,7 +247,6 @@ class Agent:
                 "Export with: python -m src.utils.export_onnx --checkpoint <ckpt>"
             )
 
-        # Per-game state
         self._step: int = 0
         self._initial_boxes: int = 50
         self._my_kills: int = 0
@@ -298,24 +254,10 @@ class Agent:
         self._prev_players: Optional[np.ndarray] = None
         self._prev_grid: Optional[np.ndarray] = None
 
-    # ------------------------------------------------------------------ #
-    # Competition interface                                                #
-    # ------------------------------------------------------------------ #
-
     def act(self, obs: dict) -> int:
-        """
-        Select an action given the current observation.
-
-        Args:
-            obs: dict with keys "map", "players", "bombs"
-
-        Returns:
-            action (int in [0, 5])
-        """
         curr_players = np.asarray(obs["players"])
         curr_grid    = np.asarray(obs["map"], dtype=np.int8)
 
-        # ── Update per-game trackers ──────────────────────────────────── #
         if self._prev_players is not None:
             prev_enemies = sum(
                 int(self._prev_players[i][2]) for i in range(4) if i != self.agent_id
@@ -332,7 +274,6 @@ class Agent:
 
         boxes_now = int((curr_grid == _BOX).sum())
 
-        # ── Feature extraction ────────────────────────────────────────── #
         spatial, aux = _extract(
             obs,
             agent_id=self.agent_id,
@@ -343,34 +284,28 @@ class Agent:
             my_boxes_destroyed=self._my_boxes,
         )
 
-        # ── Inference ─────────────────────────────────────────────────── #
         if self._backend == "onnx":
             logits: np.ndarray = self._sess.run(
                 None,
                 {
-                    "spatial": spatial[np.newaxis],   # (1, 15, 13, 13)
-                    "aux":     aux[np.newaxis],        # (1, 7)
+                    "spatial": spatial[np.newaxis],
+                    "aux":     aux[np.newaxis],
                 },
-            )[0][0]  # shape (6,)
+            )[0][0]
         else:
             import torch
             with torch.no_grad():
                 sp_t = torch.from_numpy(spatial[np.newaxis])
                 ax_t = torch.from_numpy(aux[np.newaxis])
-                logits = self._ts_model(sp_t, ax_t).numpy()[0]  # shape (6,)
+                logits = self._ts_model(sp_t, ax_t).numpy()[0]
 
-        # ── Action masking ────────────────────────────────────────────── #
         mask = _compute_mask(obs, self.agent_id)
         logits[~mask] = -1e9
 
         action = int(np.argmax(logits))
 
-        # ── Advance state ─────────────────────────────────────────────── #
         self._step += 1
         self._prev_players = curr_players.copy()
         self._prev_grid    = curr_grid.copy()
-
-        # Reset on new game (detect by step reset to 0 externally is not
-        # possible; engine calls __init__ per match, so no reset needed)
 
         return action

@@ -1,19 +1,3 @@
-"""
-Policy network for Bomberland — compatible with SB3 MaskablePPO.
-
-Architecture:
-  Spatial branch : Conv(15→64) → ResBlock(64) → ResBlock(64)
-                   → Conv(64→128, stride=2) → ResBlock(128) → flatten → 3200
-  Aux branch     : Linear(7→32→32)
-  Fusion head    : Linear(3232→256) → ReLU (BomberCNNExtractor output)
-  Actor head     : Linear(256→256) → ReLU → Linear(256→6)
-  Value head     : Linear(256→256) → ReLU → Linear(256→1)
-
-Exposed classes:
-  BomberCNNExtractor  — BaseFeaturesExtractor for SB3 MultiInputPolicy
-  BomberPolicyNet     — standalone Actor-Critic (used for BC and ONNX export)
-"""
-
 from __future__ import annotations
 
 import numpy as np
@@ -23,36 +7,21 @@ import torch.nn.functional as F
 from gymnasium import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Weight initialisation helper                                                 #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def _init_weights(module: nn.Module) -> None:
-    """Orthogonal init for Conv2d and Linear layers; zero bias."""
     if isinstance(module, (nn.Linear, nn.Conv2d)):
         nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
         if module.bias is not None:
             nn.init.zeros_(module.bias)
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Residual block                                                               #
-# ─────────────────────────────────────────────────────────────────────────── #
-
-# Grid size after stride-2 conv: ceil(13/2) = 7
 _H_FULL: int = 13
 _W_FULL: int = 13
-_H_DOWN: int = 7   # after stride-2 conv
+_H_DOWN: int = 7
 _W_DOWN: int = 7
 
 
 class ResBlock(nn.Module):
-    """
-    ResNet-style residual block with two 3×3 convolutions and LayerNorm.
-    Both spatial dimensions (H, W) must be provided so that LayerNorm shapes
-    are fixed at construction time — required for ONNX export.
-    """
-
     def __init__(self, channels: int, h: int, w: int) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
@@ -67,35 +36,16 @@ class ResBlock(nn.Module):
         return F.relu(out + residual, inplace=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Spatial encoder                                                              #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 class _SpatialEncoder(nn.Module):
-    """
-    ResNet-style CNN: (B, 15, 13, 13) → (B, 3200).
-
-    Stage 1  — Conv(15→64, 3×3, pad=1)   : (B,  64, 13, 13)
-    Stage 2  — ResBlock(64, 13, 13)       : (B,  64, 13, 13)
-    Stage 3  — ResBlock(64, 13, 13)       : (B,  64, 13, 13)
-    Stage 4  — Conv(64→128, 3×3, stride=2): (B, 128,  7,  7)
-    Stage 5  — ResBlock(128, 7, 7)        : (B, 128,  7,  7)
-    Flatten                               : (B, 6272)  → out_dim = 128*7*7 = 6272
-
-    NOTE: 128*7*7 = 6272, not 3200. The docstring header used 3200 as an
-    approximation; the actual dimension is computed from the architecture.
-    """
-
     def __init__(self) -> None:
         super().__init__()
         self.stem = nn.Conv2d(15, 64, kernel_size=3, padding=1)
         self.res1 = ResBlock(64, _H_FULL, _W_FULL)
         self.res2 = ResBlock(64, _H_FULL, _W_FULL)
-        # stride=2: 13 → 7
         self.downsample = nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2)
         self.res3 = ResBlock(128, _H_DOWN, _W_DOWN)
         self.flatten = nn.Flatten()
-        self.out_dim: int = 128 * _H_DOWN * _W_DOWN  # 6272
+        self.out_dim: int = 128 * _H_DOWN * _W_DOWN
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.relu(self.stem(x), inplace=True)
@@ -106,13 +56,7 @@ class _SpatialEncoder(nn.Module):
         return self.flatten(x)
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Aux encoder                                                                  #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 class _AuxEncoder(nn.Module):
-    """MLP that maps (B, 7) → (B, 32)."""
-
     def __init__(self) -> None:
         super().__init__()
         self.net = nn.Sequential(
@@ -127,30 +71,19 @@ class _AuxEncoder(nn.Module):
         return self.net(x)
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# SB3 features extractor (used with MaskablePPO + MultiInputPolicy)            #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 FEATURES_DIM = 256
 
 
 class BomberCNNExtractor(BaseFeaturesExtractor):
-    """
-    SB3 BaseFeaturesExtractor for Dict observation space.
-    Expected obs keys: "spatial" (15,13,13), "aux" (7,).
-    Output: (B, FEATURES_DIM) float tensor.
-    """
-
     def __init__(self, observation_space: spaces.Dict, features_dim: int = FEATURES_DIM) -> None:
         super().__init__(observation_space, features_dim)
         self.spatial_enc = _SpatialEncoder()
         self.aux_enc = _AuxEncoder()
-        fusion_in = self.spatial_enc.out_dim + self.aux_enc.out_dim  # 6272 + 32 = 6304
+        fusion_in = self.spatial_enc.out_dim + self.aux_enc.out_dim
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, features_dim),
             nn.ReLU(inplace=True),
         )
-        # Orthogonal init for all conv and linear layers
         self.apply(_init_weights)
 
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -160,35 +93,18 @@ class BomberCNNExtractor(BaseFeaturesExtractor):
         return self.fusion(combined)
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Standalone Actor-Critic (for BC training and ONNX export)                   #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 class BomberPolicyNet(nn.Module):
-    """
-    Standalone Actor-Critic network.
-    Used for:
-      - Behavioral Cloning (supervised training)
-      - ONNX export
-      - Weight loading/saving independent of SB3
-
-    forward() returns (action_logits, value):
-      action_logits: (B, 6)  — raw logits before softmax
-      value:         (B, 1)  — state value estimate
-    """
-
     def __init__(self, features_dim: int = FEATURES_DIM) -> None:
         super().__init__()
         self.spatial_enc = _SpatialEncoder()
         self.aux_enc = _AuxEncoder()
-        fusion_in = self.spatial_enc.out_dim + self.aux_enc.out_dim  # 6304
+        fusion_in = self.spatial_enc.out_dim + self.aux_enc.out_dim
 
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, features_dim),
             nn.ReLU(inplace=True),
         )
 
-        # Deeper actor and value heads (Improvement 3)
         self.policy_head = nn.Sequential(
             nn.Linear(features_dim, 256),
             nn.ReLU(inplace=True),
@@ -200,7 +116,6 @@ class BomberPolicyNet(nn.Module):
             nn.Linear(256, 1),
         )
 
-        # Orthogonal init for all conv and linear layers
         self.apply(_init_weights)
 
     def forward(
@@ -219,21 +134,14 @@ class BomberPolicyNet(nn.Module):
         spatial: torch.Tensor,
         aux: torch.Tensor,
     ) -> torch.Tensor:
-        """Policy-head only — used for BC training and inference."""
         logits, _ = self.forward(spatial, aux)
         return logits
 
-    # ------------------------------------------------------------------ #
-    # Checkpoint helpers                                                   #
-    # ------------------------------------------------------------------ #
-
     def save(self, path: str) -> None:
-        """Save model weights."""
         torch.save({"model_state_dict": self.state_dict()}, path)
 
     @classmethod
     def load(cls, path: str, device: str = "cpu") -> "BomberPolicyNet":
-        """Load model weights from checkpoint."""
         net = cls()
         ckpt = torch.load(path, map_location=device)
         state = ckpt.get("model_state_dict", ckpt)
@@ -241,17 +149,7 @@ class BomberPolicyNet(nn.Module):
         net.eval()
         return net
 
-    # ------------------------------------------------------------------ #
-    # SB3 weight transfer                                                  #
-    # ------------------------------------------------------------------ #
-
     def load_from_sb3(self, sb3_policy) -> None:
-        """
-        Copy weights from a trained SB3 MaskablePPO policy into this network.
-        Assumes net_arch=dict(pi=[256], vf=[256]) so mlp_extractor.policy_net[0]
-        is Linear(256→256) matching policy_head[0], and action_net is Linear(256→6)
-        matching policy_head[2].
-        """
         fe = sb3_policy.features_extractor
         pol = sb3_policy
         self.spatial_enc.load_state_dict(fe.spatial_enc.state_dict())
@@ -263,18 +161,12 @@ class BomberPolicyNet(nn.Module):
         self.value_head[2].load_state_dict(pol.value_net.state_dict())
 
     def init_from_bc(self, bc_path: str, device: str = "cpu") -> None:
-        """Load BC weights from a tactical_bc.py checkpoint."""
         ckpt = torch.load(bc_path, map_location=device)
         state = ckpt.get("model_state_dict", ckpt)
         self.load_state_dict(state, strict=False)
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Observation space factory (shared by env wrapper and BC trainer)             #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 def make_observation_space() -> spaces.Dict:
-    """Return SB3-compatible Dict observation space."""
     return spaces.Dict(
         {
             "spatial": spaces.Box(

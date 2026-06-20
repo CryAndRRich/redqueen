@@ -1,24 +1,3 @@
-"""
-TrapperRuleAgent — Aggressive kill-hunter optimised for tie-break #1 (Kills).
-
-Decision hierarchy (differs from TacticalRuleAgent where item > box > enemy):
-  1. Escape immediate/imminent danger (danger_now or danger_soon)
-  2. Place bomb if enemy is within blast range AND safe escape exists
-  3. Pursue nearest enemy via BFS — accepts passing through mild danger to close distance
-  4. Collect items opportunistically (higher radius → larger kill range)
-  5. Box-farm as last resort
-
-Key differences from TacticalRuleAgent:
-  - Bomb placement triggers when enemy is within blast radius (any direction),
-    not only when perfectly aligned in a clear corridor.
-  - BFS pursuit skips danger_soon avoidance, only hard-avoids danger_now.
-  - Actively evaluates "trap positions": tiles adjacent to enemy or covering
-    multiple enemy escape routes.
-
-Used as curriculum Stage 4 opponent to force the RL agent to learn
-aggressive-opponent defence strategies before self-play.
-"""
-
 from __future__ import annotations
 
 import random
@@ -26,17 +5,12 @@ from collections import deque
 
 
 class TrapperRuleAgent:
-    """Kill-oriented rule-based agent. Chases and bombs enemies aggressively."""
 
     MOVES = {0: (0, 0), 1: (-1, 0), 2: (1, 0), 3: (0, -1), 4: (0, 1)}
     team_id = "TrapperRuleAgent"
 
     def __init__(self, agent_id: int) -> None:
         self.agent_id = int(agent_id)
-
-    # ------------------------------------------------------------------ #
-    # Public interface                                                      #
-    # ------------------------------------------------------------------ #
 
     def act(self, obs: dict) -> int:
         grid    = obs["map"]
@@ -60,35 +34,29 @@ class TrapperRuleAgent:
 
         danger_soon, danger_now = self._danger_tiles(grid, bombs, players)
 
-        # ── 1. Escape if in danger ──────────────────────────────────── #
         if my_pos in danger_now or my_pos in danger_soon:
             action = self._escape(grid, my_pos, blocked, danger_now, danger_soon)
             return action if action is not None else 0
 
-        # ── 2. Bomb if enemy in blast range + safe escape ─────────────── #
         if bombs_left > 0 and my_pos not in bomb_pos:
             if self._can_bomb_hit_enemy(grid, my_pos, enemies, my_radius):
                 if self._can_escape_after_placing(grid, my_pos, blocked, danger_soon, my_radius):
                     return 5
-            # Place bomb if adjacent to enemy (even if not same row/col)
             if enemies and my_pos in self._adjacent_to_enemies(enemies):
                 if self._can_escape_after_placing(grid, my_pos, blocked, danger_soon, my_radius):
                     return 5
 
-        # ── 3. Pursue nearest enemy (aggressive BFS — ignores danger_soon) ─ #
         if enemies:
             action = self._pursue_enemy(grid, my_pos, enemies, blocked, danger_now)
             if action is not None:
                 return action
 
-        # ── 4. Collect items (opportunistic) ─────────────────────────── #
         items = self._item_tiles(grid)
         if items:
             action = self._bfs_move(grid, my_pos, items, blocked, avoid=danger_soon)
             if action is not None:
                 return action
 
-        # ── 5. Farm boxes ─────────────────────────────────────────────── #
         if bombs_left > 0 and my_pos not in bomb_pos:
             if self._count_boxes_in_blast(grid, my_pos, my_radius) > 0:
                 if self._can_escape_after_placing(grid, my_pos, blocked, danger_soon, my_radius):
@@ -99,14 +67,9 @@ class TrapperRuleAgent:
             if action is not None:
                 return action
 
-        # ── 6. Safe random walk ───────────────────────────────────────── #
         valid = self._valid_actions(grid, my_pos, blocked)
         safe  = [a for a in valid if self._next_pos(my_pos, a) not in danger_soon]
         return random.choice(safe) if safe else (random.choice(valid) if valid else 0)
-
-    # ------------------------------------------------------------------ #
-    # Navigation helpers                                                   #
-    # ------------------------------------------------------------------ #
 
     def _pursue_enemy(
         self,
@@ -116,11 +79,6 @@ class TrapperRuleAgent:
         blocked: set,
         danger_now: set,
     ) -> int | None:
-        """
-        BFS toward nearest enemy.
-        Avoids only danger_now (not danger_soon) — intentionally aggressive.
-        Also tries to reach a "trap position" adjacent to the enemy.
-        """
         targets: set[tuple] = set(enemies) | self._adjacent_to_enemies(enemies)
         q: deque = deque([(start, None)])
         seen: set = {start}
@@ -144,7 +102,6 @@ class TrapperRuleAgent:
         return None
 
     def _adjacent_to_enemies(self, enemies: list[tuple]) -> set[tuple]:
-        """All tiles that are exactly 1 step away from any alive enemy."""
         adj: set[tuple] = set()
         for ex, ey in enemies:
             for dx, dy in self.MOVES.values():
@@ -159,7 +116,6 @@ class TrapperRuleAgent:
         blocked: set,
         avoid: set,
     ) -> int | None:
-        """Standard BFS avoiding `avoid` (typically danger_soon)."""
         if not targets:
             return None
         q: deque = deque([(start, None)])
@@ -189,7 +145,6 @@ class TrapperRuleAgent:
         danger_now: set,
         danger_soon: set,
     ) -> int | None:
-        """Best-first escape from danger: prefers tiles outside danger_soon."""
         best_action = None
         best_score  = -10 ** 9
         for a in self._valid_actions(grid, my_pos, blocked):
@@ -204,12 +159,7 @@ class TrapperRuleAgent:
                 best_action = a
         return best_action
 
-    # ------------------------------------------------------------------ #
-    # Bomb logic                                                           #
-    # ------------------------------------------------------------------ #
-
     def _can_bomb_hit_enemy(self, grid, my_pos: tuple, enemies: list[tuple], radius: int) -> bool:
-        """True if placing a bomb at my_pos would reach any enemy in its blast."""
         blast = self._blast_tiles(grid, my_pos[0], my_pos[1], radius)
         return any(e in blast for e in enemies)
 
@@ -248,10 +198,6 @@ class TrapperRuleAgent:
     def _count_boxes_in_blast(self, grid, my_pos: tuple, radius: int) -> int:
         return sum(1 for x, y in self._blast_tiles(grid, my_pos[0], my_pos[1], radius)
                    if grid[x, y] == 2)
-
-    # ------------------------------------------------------------------ #
-    # Grid helpers                                                         #
-    # ------------------------------------------------------------------ #
 
     def _blast_tiles(self, grid, bx: int, by: int, radius: int) -> set[tuple]:
         h, w = grid.shape

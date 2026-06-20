@@ -1,28 +1,3 @@
-"""
-Local match runner — pit agents against each other for headless testing.
-
-Usage:
-    # 4 random baselines
-    python -m scripts.run_local_match
-
-    # Your submission agent vs 3 genius bots
-    python -m scripts.run_local_match --agent_paths agent/agent.py GeniusRuleAgent GeniusRuleAgent GeniusRuleAgent --num_episodes 20
-
-    # Visual mode (requires pygame)
-    python -m scripts.run_local_match --agent_paths agent/agent.py None None None --visualize true
-
-Agent path formats:
-    path/to/agent.py         — load Agent class from file
-    path/to/folder/          — load Agent class from folder/agent.py
-    RandomAgent              — built-in random baseline
-    SimpleRuleAgent          — built-in simple rule agent
-    SmarterRuleAgent         — built-in smarter rule agent
-    GeniusRuleAgent          — built-in genius rule agent (strongest baseline)
-    BoxFarmerAgent           — built-in box-focused agent
-    TacticalRuleAgent        — built-in tactical rule agent
-    None / random            — randomly picked built-in baseline
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -90,7 +65,6 @@ def make_agents(agent_paths: list[str], seed: int | None = None) -> tuple[list, 
             names.append(path)
             continue
 
-        # Custom file/folder path
         p = Path(path)
         if p.is_dir():
             p = p / "agent.py"

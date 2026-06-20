@@ -45,7 +45,6 @@ class SimpleRuleAgent:
         danger_soon, danger_now = self._danger_tiles(grid, bombs, players, default_radius=2)
         valid_actions = self._valid_actions(grid, my_pos, blocked)
 
-        # 1) Escape danger first
         if my_pos in danger_now or my_pos in danger_soon:
             move = self._move_to_targets(grid, my_pos, blocked, self._safe_tiles(grid, danger_soon), danger_soon)
             if move is not None:
@@ -53,7 +52,6 @@ class SimpleRuleAgent:
             safe_moves = [a for a in valid_actions if self._next_pos(my_pos, a) not in danger_now]
             return random.choice(safe_moves) if safe_moves else 0
 
-        # 2) Pick nearby items
         item_tiles = self._item_tiles(
             grid,
             prefer_capacity=int(bombs_left) <= 1,
@@ -64,7 +62,6 @@ class SimpleRuleAgent:
             if move is not None:
                 return move
 
-        # 3) Place bomb to break adjacent boxes or hit adjacent enemy (if escape exists)
         if bombs_left > 0 and my_pos not in bomb_positions:
             adjacent_enemy = any(abs(ex - my_pos[0]) + abs(ey - my_pos[1]) == 1 for ex, ey in enemies)
             boxes_hit = self._count_boxes_in_blast(grid, my_pos, bomb_radius)
@@ -73,14 +70,12 @@ class SimpleRuleAgent:
             ):
                 return 5
 
-        # 4) Move toward a tile where bombing would break boxes
         box_spots = self._box_bomb_spots(grid, blocked)
         if box_spots:
             move = self._move_to_targets(grid, my_pos, blocked, box_spots, danger_soon)
             if move is not None:
                 return move
 
-        # 5) Fallback safe movement
         safe_moves = [a for a in valid_actions if self._next_pos(my_pos, a) not in danger_soon]
         return random.choice(safe_moves) if safe_moves else 0
 

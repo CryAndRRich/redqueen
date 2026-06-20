@@ -1,21 +1,3 @@
-"""
-ONNX export pipeline for BomberPolicyNet.
-
-Exports the policy head (logits only — no value) with fixed input shapes
-so onnxruntime can run inference without dynamic axes.
-
-Input shapes (fixed):
-  spatial: (1, 15, 13, 13) float32
-  aux:     (1, 7)          float32
-
-Output:
-  logits:  (1, 6)          float32  — raw action logits
-
-Usage:
-    python -m src.utils.export_onnx --checkpoint checkpoints/bc_best.pt
-    python -m src.utils.export_onnx --checkpoint checkpoints/ppo_best.pt --output exports/model.onnx
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -30,16 +12,10 @@ _ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.models.policy_network import BomberPolicyNet  # noqa: E402
+from src.models.policy_network import BomberPolicyNet
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# ONNX-compatible policy wrapper                                               #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 class _PolicyONNXWrapper(torch.nn.Module):
-    """Wraps BomberPolicyNet to export only the logit output."""
-
     def __init__(self, net: BomberPolicyNet) -> None:
         super().__init__()
         self.net = net
@@ -53,43 +29,24 @@ class _PolicyONNXWrapper(torch.nn.Module):
         return logits
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# Export function                                                              #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 def export_to_onnx(
     checkpoint_path: Path,
     output_path: Path,
     opset: int = 17,
     verify: bool = True,
 ) -> Path:
-    """
-    Load BomberPolicyNet from checkpoint and export to ONNX.
-
-    Args:
-        checkpoint_path: .pt file with model_state_dict
-        output_path:     destination .onnx file
-        opset:           ONNX opset version (17 recommended)
-        verify:          run a test inference to confirm output matches PyTorch
-
-    Returns:
-        Path to the exported ONNX file
-    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Load model
     print(f"Loading checkpoint: {checkpoint_path}")
     net = BomberPolicyNet.load(str(checkpoint_path), device="cpu")
     net.eval()
     wrapper = _PolicyONNXWrapper(net)
     wrapper.eval()
 
-    # Dummy inputs (fixed batch size = 1)
     dummy_spatial = torch.zeros(1, 15, 13, 13, dtype=torch.float32)
     dummy_aux     = torch.zeros(1, 7,       dtype=torch.float32)
 
-    # Export
-    print(f"Exporting to {output_path} (opset {opset}) …")
+    print(f"Exporting to {output_path} (opset {opset}) ...")
     torch.onnx.export(
         wrapper,
         (dummy_spatial, dummy_aux),
@@ -99,12 +56,11 @@ def export_to_onnx(
         do_constant_folding=True,
         input_names=["spatial", "aux"],
         output_names=["logits"],
-        dynamic_axes=None,  # fixed shapes for best onnxruntime performance
-        dynamo=False,        # use TorchScript exporter — no onnxscript dep needed
+        dynamic_axes=None,
+        dynamo=False,
     )
     print(f"Exported: {output_path}  ({output_path.stat().st_size / 1024:.1f} KB)")
 
-    # ── Verify ────────────────────────────────────────────────────────── #
     if verify:
         _verify_onnx(wrapper, output_path, dummy_spatial, dummy_aux)
 
@@ -117,7 +73,6 @@ def _verify_onnx(
     dummy_spatial: torch.Tensor,
     dummy_aux: torch.Tensor,
 ) -> None:
-    """Run PyTorch and ONNX inference and assert outputs are close."""
     try:
         import onnxruntime as ort
         import onnx
@@ -125,12 +80,10 @@ def _verify_onnx(
         print("onnxruntime / onnx not installed — skipping verification.")
         return
 
-    # Check ONNX model validity
     model_proto = onnx.load(str(onnx_path))
     onnx.checker.check_model(model_proto)
     print("ONNX model check: OK")
 
-    # Compare outputs
     sess = ort.InferenceSession(
         str(onnx_path),
         providers=["CPUExecutionProvider"],
@@ -148,9 +101,8 @@ def _verify_onnx(
     max_diff = float(np.abs(ort_logits - pt_logits).max())
     print(f"Max abs diff (PyTorch vs ONNX): {max_diff:.6f}")
     assert max_diff < 1e-4, f"ONNX output deviates too much: {max_diff}"
-    print("Verification PASSED ✓")
+    print("Verification PASSED")
 
-    # Benchmark inference speed
     _benchmark(sess, spatial_np, aux_np)
 
 
@@ -160,8 +112,6 @@ def _benchmark(
     aux_np: np.ndarray,
     n_runs: int = 1000,
 ) -> None:
-    """Print median inference time per step."""
-    import time
     times = []
     for _ in range(n_runs):
         t0 = time.perf_counter()
@@ -177,27 +127,10 @@ def _benchmark(
         print("Inference budget check: OK (< 100 ms)")
 
 
-# ─────────────────────────────────────────────────────────────────────────── #
-# TorchScript export (fallback for environments without onnxruntime)           #
-# ─────────────────────────────────────────────────────────────────────────── #
-
 def export_torchscript(
     checkpoint_path: Path,
     output_path: Path,
 ) -> Path:
-    """
-    Load BomberPolicyNet from checkpoint and export to TorchScript via torch.jit.trace.
-
-    The traced module takes (spatial, aux) and returns logits, identical to the
-    _PolicyONNXWrapper interface — so agent.py can load it with torch.jit.load.
-
-    Args:
-        checkpoint_path: .pt file with model_state_dict
-        output_path:     destination .pt TorchScript file
-
-    Returns:
-        Path to the exported TorchScript file
-    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading checkpoint for TorchScript export: {checkpoint_path}")
@@ -209,24 +142,19 @@ def export_torchscript(
     dummy_spatial = torch.zeros(1, 15, 13, 13, dtype=torch.float32)
     dummy_aux     = torch.zeros(1, 7,       dtype=torch.float32)
 
-    print(f"Tracing to TorchScript: {output_path} …")
+    print(f"Tracing to TorchScript: {output_path} ...")
     traced = torch.jit.trace(wrapper, (dummy_spatial, dummy_aux))
     torch.jit.save(traced, str(output_path))
     print(f"TorchScript saved: {output_path}  ({output_path.stat().st_size / 1024:.1f} KB)")
 
-    # Quick sanity check
     loaded = torch.jit.load(str(output_path), map_location="cpu")
     with torch.no_grad():
         out = loaded(dummy_spatial, dummy_aux)
     assert out.shape == (1, 6), f"Unexpected output shape: {out.shape}"
-    print("TorchScript verification PASSED ✓")
+    print("TorchScript verification PASSED")
 
     return output_path
 
-
-# ─────────────────────────────────────────────────────────────────────────── #
-# CLI                                                                          #
-# ─────────────────────────────────────────────────────────────────────────── #
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="Export BomberPolicyNet to ONNX and/or TorchScript")
